@@ -2,8 +2,8 @@ import numpy as np
 from typing import Dict, List, Any, Optional, Tuple, Union, Type
 
 from src.algorithms.bayesian.qnehvi import QNEHVI
-from src.algorithms.bayesian.qehvi import QEHVI
-from src.algorithms.bayesian.qparego import QNParEGO
+# from src.algorithms.bayesian.qehvi import QEHVI
+# from src.algorithms.bayesian.qparego import QNParEGO
 
 # Import evolutionary algorithm classes from pymoo
 from pymoo.algorithms.moo.nsga2 import NSGA2 as PyMOO_NSGA2
@@ -323,10 +323,10 @@ def get_algorithm_adapter(algorithm_name: str) -> AlgorithmAdapter:
     # Bayesian optimization algorithms
     if algorithm_name == 'qnehvi':
         return BayesianOptAdapter(QNEHVI)
-    elif algorithm_name == 'qehvi':
-        return BayesianOptAdapter(QEHVI)
-    elif algorithm_name == 'qparego':
-        return BayesianOptAdapter(QNParEGO)
+    # elif algorithm_name == 'qehvi':
+    #     return BayesianOptAdapter(QEHVI)
+    # elif algorithm_name == 'qparego':
+    #     return BayesianOptAdapter(QNParEGO)
     
     # Evolutionary algorithms
     elif algorithm_name == 'nsga2':

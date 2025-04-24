@@ -7,6 +7,7 @@ import json
 import numpy as np
 import matplotlib.pyplot as plt
 import subprocess
+import re
 from typing import Dict, List, Any, Tuple, Optional, Union, Type
 
 # Add the project root to the path
@@ -28,7 +29,8 @@ def run_individual_benchmark(algorithm, problem, budget, batch_size, output_dir)
         '--problem', problem,
         '--budget', str(budget),
         '--batch-size', str(batch_size),
-        '--output-dir', algorithm_dir
+        '--output-dir', algorithm_dir,
+        '--verbose',  # Add verbose flag to get iteration details
     ]
     
     print(f"Running benchmark: {algorithm} on {problem}")
@@ -50,6 +52,17 @@ def run_individual_benchmark(algorithm, problem, budget, batch_size, output_dir)
         hypervolume = None
         pareto_size = None
         
+        # Extract hypervolume history
+        hypervolume_history = []
+        iteration_pattern = re.compile(r'Iteration (\d+).*hypervolume: ([\d\.]+)')
+        for match in iteration_pattern.finditer(stdout):
+            iteration = int(match.group(1))
+            hv = float(match.group(2))
+            while len(hypervolume_history) < iteration:
+                # Fill any missing iterations with previous value or 0
+                hypervolume_history.append(hypervolume_history[-1] if hypervolume_history else 0)
+            hypervolume_history.append(hv)
+        
         for line in stdout.split('\n'):
             if "Optimization completed in" in line:
                 runtime = float(line.split('in')[1].split('seconds')[0].strip())
@@ -64,6 +77,7 @@ def run_individual_benchmark(algorithm, problem, budget, batch_size, output_dir)
             'runtime': runtime,
             'hypervolume': hypervolume,
             'pareto_size': pareto_size,
+            'hypervolume_history': hypervolume_history,
             'success': True,
             'stdout': stdout,
             'stderr': stderr
@@ -83,6 +97,7 @@ def run_individual_benchmark(algorithm, problem, budget, batch_size, output_dir)
             'runtime': None,
             'hypervolume': None,
             'pareto_size': None,
+            'hypervolume_history': [],
             'success': False,
             'error': str(e)
         }
@@ -169,6 +184,27 @@ def generate_comparison_plots(results, output_dir):
         plt.savefig(os.path.join(problem_dir, f'pareto_size_comparison.png'))
         plt.close()
         
+        # Plot hypervolume vs iteration curves for all algorithms
+        plt.figure(figsize=(12, 8))
+        for result in problem_results:
+            if 'hypervolume_history' in result and result['hypervolume_history']:
+                plt.plot(
+                    range(len(result['hypervolume_history'])), 
+                    result['hypervolume_history'],
+                    label=result['algorithm'],
+                    marker='o',
+                    markersize=4,
+                    linewidth=2
+                )
+        
+        plt.title(f'Hypervolume Convergence on {problem}')
+        plt.xlabel('Iteration')
+        plt.ylabel('Hypervolume')
+        plt.grid(True)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(os.path.join(problem_dir, f'hypervolume_convergence.png'))
+        plt.close()
         # Aggregate plot visualizing all evaluation trajectories
         # This provides a comprehensive view of how algorithms explore the objective space
         plt.figure(figsize=(12, 8))
@@ -243,6 +279,47 @@ def generate_comparison_plots(results, output_dir):
     plt.grid(True, axis='y')
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, 'avg_pareto_size_comparison.png'))
+    plt.close()
+    
+    # Create aggregated hypervolume convergence plot across problems
+    # For each algorithm, we'll average hypervolume histories across all problems
+    plt.figure(figsize=(12, 8))
+    
+    for algorithm in algorithms:
+        algo_results = [r for r in results_by_algorithm[algorithm] if r['success'] and 'hypervolume_history' in r and r['hypervolume_history']]
+        
+        if algo_results:
+            # Find the maximum length of hypervolume history
+            max_len = max([len(r['hypervolume_history']) for r in algo_results])
+            
+            # Pad shorter histories with their last value
+            padded_histories = []
+            for r in algo_results:
+                history = r['hypervolume_history'].copy()
+                if len(history) < max_len:
+                    history.extend([history[-1]] * (max_len - len(history)))
+                padded_histories.append(history)
+            
+            # Calculate average history
+            avg_history = np.mean(padded_histories, axis=0)
+            
+            # Plot average history
+            plt.plot(
+                range(len(avg_history)),
+                avg_history,
+                label=algorithm,
+                marker='o',
+                markersize=4,
+                linewidth=2
+            )
+    
+    plt.title('Average Hypervolume Convergence Across All Problems')
+    plt.xlabel('Iteration')
+    plt.ylabel('Average Hypervolume')
+    plt.grid(True)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'avg_hypervolume_convergence.png'))
     plt.close()
     
     # Create heatmaps for each metric

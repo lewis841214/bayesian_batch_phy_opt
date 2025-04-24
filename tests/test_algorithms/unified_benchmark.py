@@ -17,7 +17,7 @@ from tests.test_algorithms.test_problems import get_test_problem, list_test_prob
 # Import algorithm adapters
 from src.adapters.algorithm_adapters import get_algorithm_adapter
 
-def run_optimization(algorithm_name, problem_name, budget, batch_size, output_dir=None):
+def run_optimization(algorithm_name, problem_name, budget, batch_size, output_dir=None, verbose=False):
     """Run specified optimization algorithm on the given problem"""
     print(f"Running {algorithm_name} on {problem_name} with budget {budget} and batch size {batch_size}")
     
@@ -34,6 +34,7 @@ def run_optimization(algorithm_name, problem_name, budget, batch_size, output_di
     remaining_budget = budget
     all_evaluated_x = []
     all_evaluated_y = []
+    hypervolume_history = []  # Track hypervolume at each iteration
     
     # Create progress bar for overall optimization
     pbar = tqdm(total=budget, desc=f"Optimizing with {algorithm_name}", 
@@ -66,9 +67,12 @@ def run_optimization(algorithm_name, problem_name, budget, batch_size, output_di
         remaining_budget -= current_batch
         pbar.update(current_batch)
         
-        # Print some info about current best point
+        # Record hypervolume
+        current_hv = 0.0
         if hasattr(adapter, 'get_hypervolume'):
-            tqdm.write(f"Current hypervolume: {adapter.get_hypervolume():.6f}")
+            current_hv = adapter.get_hypervolume()
+            hypervolume_history.append(current_hv)
+            tqdm.write(f"Iteration {iteration+1}: Current hypervolume: {current_hv:.6f}")
         
         iteration += 1
     
@@ -82,6 +86,7 @@ def run_optimization(algorithm_name, problem_name, budget, batch_size, output_di
     print(f"Optimization completed in {runtime:.2f} seconds")
     print(f"Final hypervolume: {hypervolume:.6f}")
     print(f"Pareto front size: {len(pareto_x)}")
+    print(f"Total evaluated points: {len(all_evaluated_y)}")
     
     # Plot results
     if output_dir and problem.num_objectives in [2, 3]:
@@ -91,9 +96,22 @@ def run_optimization(algorithm_name, problem_name, budget, batch_size, output_di
         # Create output directory
         os.makedirs(output_dir, exist_ok=True)
         
+        # Plot hypervolume progression
+        if hypervolume_history:
+            plt.figure(figsize=(10, 6))
+            plt.plot(range(1, len(hypervolume_history) + 1), hypervolume_history, 
+                     marker='o', markersize=4, linewidth=2)
+            plt.title(f'Hypervolume Convergence: {algorithm_name} on {problem_name}')
+            plt.xlabel('Iteration')
+            plt.ylabel('Hypervolume')
+            plt.grid(True)
+            plt.tight_layout()
+            plt.savefig(os.path.join(output_dir, f'{algorithm_name}_{problem_name}_hypervolume.png'))
+            plt.close()
+        
         if problem.num_objectives == 2:
             # Create figure with proper layout for colorbar
-            fig, ax = plt.subplots(figsize=(10, 6))
+            fig, ax = plt.subplots(figsize=(10, 8))
             
             # Plot all evaluated points with alpha scaling by recency
             if len(all_ys) > 0:
@@ -105,14 +123,34 @@ def run_optimization(algorithm_name, problem_name, budget, batch_size, output_di
                                     c=np.arange(n_points),
                                     cmap='Blues',
                                     alpha=0.7, 
-                                    label='Evaluated points')
+                                    label=f'Evaluated points ({n_points})')
                 
                 # Add a color bar to show progression (using the figure and specific axes)
                 cbar = fig.colorbar(scatter, ax=ax)
                 cbar.set_label('Evaluation order')
+                
+                # Add numbers to selected evaluated points
+                # For clarity, number only a subset of points - every nth point
+                step = max(1, n_points // 20)  # Show at most ~20 numbered points
+                for i in range(0, n_points, step):
+                    # Use a different format than Pareto points - E for evaluated
+                    ax.annotate(f"E{i+1}", (all_ys[i, 0], all_ys[i, 1]), 
+                               xytext=(3, 3), textcoords='offset points',
+                               fontsize=8, color='darkblue', weight='bold',
+                               bbox=dict(facecolor='white', alpha=0.7, pad=0.1, edgecolor='none'))
             
             # Plot Pareto front with higher opacity
-            ax.scatter(pareto_ys[:, 0], pareto_ys[:, 1], color='red', label='Pareto front')
+            ax.scatter(pareto_ys[:, 0], pareto_ys[:, 1], color='red', s=80, label=f'Pareto front ({len(pareto_ys)})')
+            
+            # Add point numbers to Pareto front points
+            for i, (x, y) in enumerate(zip(pareto_ys[:, 0], pareto_ys[:, 1])):
+                ax.annotate(f"P{i+1}", (x, y), xytext=(5, 5), textcoords='offset points', 
+                           fontsize=9, fontweight='bold', color='black')
+            
+            # Add stats text
+            stats_text = f"Total points: {len(all_ys)}\nPareto points: {len(pareto_ys)}"
+            ax.text(0.02, 0.98, stats_text, transform=ax.transAxes, fontsize=12, fontweight='bold',
+                   bbox=dict(facecolor='white', alpha=0.8), va='top')
             
             # Sort for line if more than one point
             if len(pareto_ys) > 1:
@@ -128,10 +166,13 @@ def run_optimization(algorithm_name, problem_name, budget, batch_size, output_di
             plt.tight_layout()
             plt.savefig(os.path.join(output_dir, f'{algorithm_name}_{problem_name}_pareto.png'))
             plt.close()
+
+            # breakpoint()
             
             # Save raw data for later analysis
             np.save(os.path.join(output_dir, f'{algorithm_name}_{problem_name}_pareto_y.npy'), pareto_ys)
             np.save(os.path.join(output_dir, f'{algorithm_name}_{problem_name}_all_y.npy'), all_ys)
+            np.save(os.path.join(output_dir, f'{algorithm_name}_{problem_name}_hypervolume.npy'), np.array(hypervolume_history))
         
         elif problem.num_objectives == 3:
             fig = plt.figure(figsize=(10, 8))
@@ -147,14 +188,31 @@ def run_optimization(algorithm_name, problem_name, budget, batch_size, output_di
                                     c=np.arange(n_points), 
                                     cmap='Blues',
                                     alpha=0.7,
-                                    label='Evaluated points')
+                                    label=f'Evaluated points ({n_points})')
                 
                 # Add a color bar to show progression
                 cbar = fig.colorbar(scatter, ax=ax)
                 cbar.set_label('Evaluation order')
+                
+                # Number a subset of points (too many would be cluttered in 3D)
+                step = max(1, n_points // 10)  # Show at most ~10 numbered points
+                for i in range(0, n_points, step):
+                    ax.text(all_ys[i, 0], all_ys[i, 1], all_ys[i, 2], f"E{i+1}", 
+                           fontsize=8, color='darkblue', weight='bold',
+                           bbox=dict(facecolor='white', alpha=0.7, pad=0.1))
             
             # Plot Pareto front with higher opacity
-            ax.scatter(pareto_ys[:, 0], pareto_ys[:, 1], pareto_ys[:, 2], c='r', marker='o', label='Pareto front')
+            ax.scatter(pareto_ys[:, 0], pareto_ys[:, 1], pareto_ys[:, 2], c='r', marker='o', s=80, 
+                      label=f'Pareto front ({len(pareto_ys)})')
+            
+            # Add point numbers to Pareto front points
+            for i, (x, y, z) in enumerate(zip(pareto_ys[:, 0], pareto_ys[:, 1], pareto_ys[:, 2])):
+                ax.text(x, y, z, f"P{i+1}", fontsize=9, fontweight='bold', color='black')
+            
+            # Add stats text
+            stats_text = f"Total points: {len(all_ys)}\nPareto points: {len(pareto_ys)}"
+            ax.text2D(0.02, 0.98, stats_text, transform=ax.transAxes, fontsize=12, fontweight='bold',
+                     bbox=dict(facecolor='white', alpha=0.8), va='top')
             
             ax.set_xlabel('Objective 1')
             ax.set_ylabel('Objective 2')
@@ -171,13 +229,15 @@ def run_optimization(algorithm_name, problem_name, budget, batch_size, output_di
         'problem': problem_name,
         'runtime': runtime,
         'hypervolume': hypervolume,
+        'hypervolume_history': hypervolume_history,
         'pareto_size': len(pareto_x),
+        'total_points': len(all_evaluated_y),
         'pareto_y': pareto_y,
         'all_evaluated_x': all_evaluated_x,
         'all_evaluated_y': all_evaluated_y
     }
 
-def compare_algorithms(problem_name, algorithms, budget, batch_size, output_dir=None):
+def compare_algorithms(problem_name, algorithms, budget, batch_size, output_dir=None, verbose=False):
     """Compare specified algorithms on a problem"""
     results = []
     
@@ -187,7 +247,8 @@ def compare_algorithms(problem_name, algorithms, budget, batch_size, output_dir=
             problem_name=problem_name,
             budget=budget,
             batch_size=batch_size,
-            output_dir=output_dir
+            output_dir=output_dir,
+            verbose=verbose
         )
         results.append(result)
     
@@ -195,15 +256,38 @@ def compare_algorithms(problem_name, algorithms, budget, batch_size, output_dir=
     print("\n" + "="*80)
     print(f"Comparison on {problem_name}")
     print("="*80)
-    print(f"{'Algorithm':<10} {'Runtime (s)':<15} {'Hypervolume':<15} {'Pareto Size':<15}")
+    print(f"{'Algorithm':<10} {'Runtime (s)':<15} {'Hypervolume':<15} {'Pareto Size':<15} {'Total Points':<15}")
     print("-"*80)
     
     for result in results:
-        print(f"{result['algorithm']:<10} {result['runtime']:<15.2f} {result['hypervolume']:<15.6f} {result['pareto_size']:<15}")
+        print(f"{result['algorithm']:<10} {result['runtime']:<15.2f} {result['hypervolume']:<15.6f} "
+              f"{result['pareto_size']:<15} {result.get('total_points', 0):<15}")
     
     # Plot comparisons
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
+        
+        # Plot hypervolume convergence for all algorithms
+        plt.figure(figsize=(12, 8))
+        for result in results:
+            if 'hypervolume_history' in result and result['hypervolume_history']:
+                plt.plot(
+                    range(1, len(result['hypervolume_history']) + 1), 
+                    result['hypervolume_history'],
+                    label=result['algorithm'],
+                    marker='o',
+                    markersize=4,
+                    linewidth=2
+                )
+                
+        plt.title(f'Hypervolume Convergence on {problem_name}')
+        plt.xlabel('Iteration')
+        plt.ylabel('Hypervolume')
+        plt.grid(True)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, f'hypervolume_convergence_{problem_name}.png'))
+        plt.close()
         
         # Bar chart for runtimes
         plt.figure(figsize=(10, 6))
@@ -234,15 +318,40 @@ def compare_algorithms(problem_name, algorithms, budget, batch_size, output_dir=
         # If 2-objective problem, plot all Pareto fronts
         problem = get_test_problem(problem_name)
         if problem.num_objectives == 2:
-            plt.figure(figsize=(10, 6))
+            plt.figure(figsize=(12, 8))
+            
+            # Dictionary to store point counts
+            point_counts = {}
             
             for result in results:
                 pareto_y = np.array(result['pareto_y'])
+                all_y = np.array(result['all_evaluated_y'])
+                algo_name = result['algorithm']
+                point_counts[algo_name] = {
+                    'pareto': len(pareto_y),
+                    'total': len(all_y)
+                }
+                
+                # Plot all evaluated points with low opacity
+                if len(all_y) > 0:
+                    plt.scatter(all_y[:, 0], all_y[:, 1], alpha=0.3, s=20, 
+                               label=f"{algo_name} all points ({len(all_y)})")
+                
+                # Plot Pareto front with higher opacity
                 if len(pareto_y) > 0:
-                    plt.scatter(pareto_y[:, 0], pareto_y[:, 1], label=result['algorithm'])
+                    plt.scatter(pareto_y[:, 0], pareto_y[:, 1], alpha=0.8, s=80, 
+                              label=f"{algo_name} Pareto ({len(pareto_y)})")
+                    
                     if len(pareto_y) > 1:
                         sorted_pareto = pareto_y[pareto_y[:, 0].argsort()]
                         plt.plot(sorted_pareto[:, 0], sorted_pareto[:, 1], '--')
+            
+            # Add a summary of point counts in the top-left corner
+            summary_text = "\n".join([f"{algo}: {counts['total']} total, {counts['pareto']} Pareto" 
+                                    for algo, counts in point_counts.items()])
+            plt.text(0.02, 0.98, summary_text, transform=plt.gca().transAxes, 
+                    fontsize=10, fontweight='bold', verticalalignment='top',
+                    bbox=dict(facecolor='white', alpha=0.8))
             
             plt.title(f'Pareto Front Comparison on {problem_name}')
             plt.xlabel('Objective 1')
@@ -254,7 +363,7 @@ def compare_algorithms(problem_name, algorithms, budget, batch_size, output_dir=
     
     return results
 
-def compare_across_problems(problems, algorithms, budget, batch_size, output_dir=None):
+def compare_across_problems(problems, algorithms, budget, batch_size, output_dir=None, verbose=False):
     """Compare algorithms across multiple problems"""
     all_results = []
     
@@ -274,7 +383,8 @@ def compare_across_problems(problems, algorithms, budget, batch_size, output_dir
                 problem_name=problem,
                 budget=budget,
                 batch_size=batch_size,
-                output_dir=os.path.join(output_dir, problem) if output_dir else None
+                output_dir=os.path.join(output_dir, problem) if output_dir else None,
+                verbose=verbose
             )
             problem_results.append(result)
             
@@ -282,11 +392,12 @@ def compare_across_problems(problems, algorithms, budget, batch_size, output_dir
         print("\n" + "="*80)
         print(f"Comparison on {problem}")
         print("="*80)
-        print(f"{'Algorithm':<10} {'Runtime (s)':<15} {'Hypervolume':<15} {'Pareto Size':<15}")
+        print(f"{'Algorithm':<10} {'Runtime (s)':<15} {'Hypervolume':<15} {'Pareto Size':<15} {'Total Points':<15}")
         print("-"*80)
         
         for result in problem_results:
-            print(f"{result['algorithm']:<10} {result['runtime']:<15.2f} {result['hypervolume']:<15.6f} {result['pareto_size']:<15}")
+            print(f"{result['algorithm']:<10} {result['runtime']:<15.2f} {result['hypervolume']:<15.6f} "
+                  f"{result['pareto_size']:<15} {result.get('total_points', 0):<15}")
             
         # Add results to overall results
         all_results.extend(problem_results)
@@ -295,6 +406,28 @@ def compare_across_problems(problems, algorithms, budget, batch_size, output_dir
         if output_dir:
             problem_dir = os.path.join(output_dir, problem)
             os.makedirs(problem_dir, exist_ok=True)
+            
+            # Plot hypervolume convergence for all algorithms
+            plt.figure(figsize=(12, 8))
+            for result in problem_results:
+                if 'hypervolume_history' in result and result['hypervolume_history']:
+                    plt.plot(
+                        range(1, len(result['hypervolume_history']) + 1), 
+                        result['hypervolume_history'],
+                        label=result['algorithm'],
+                        marker='o',
+                        markersize=4,
+                        linewidth=2
+                    )
+                    
+            plt.title(f'Hypervolume Convergence on {problem}')
+            plt.xlabel('Iteration')
+            plt.ylabel('Hypervolume')
+            plt.grid(True)
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(os.path.join(problem_dir, f'hypervolume_convergence_{problem}.png'))
+            plt.close()
             
             # Bar chart for runtimes
             plt.figure(figsize=(10, 6))
@@ -325,15 +458,40 @@ def compare_across_problems(problems, algorithms, budget, batch_size, output_dir
             # If 2-objective problem, plot all Pareto fronts
             problem_obj = get_test_problem(problem)
             if problem_obj.num_objectives == 2:
-                plt.figure(figsize=(10, 6))
+                plt.figure(figsize=(12, 8))
+                
+                # Dictionary to store point counts
+                point_counts = {}
                 
                 for result in problem_results:
                     pareto_y = np.array(result['pareto_y'])
+                    all_y = np.array(result['all_evaluated_y'])
+                    algo_name = result['algorithm']
+                    point_counts[algo_name] = {
+                        'pareto': len(pareto_y),
+                        'total': len(all_y)
+                    }
+                    
+                    # Plot all evaluated points with low opacity
+                    if len(all_y) > 0:
+                        plt.scatter(all_y[:, 0], all_y[:, 1], alpha=0.3, s=20, 
+                                   label=f"{algo_name} all points ({len(all_y)})")
+                    
+                    # Plot Pareto front with higher opacity
                     if len(pareto_y) > 0:
-                        plt.scatter(pareto_y[:, 0], pareto_y[:, 1], label=result['algorithm'])
+                        plt.scatter(pareto_y[:, 0], pareto_y[:, 1], alpha=0.8, s=80, 
+                                  label=f"{algo_name} Pareto ({len(pareto_y)})")
+                        
                         if len(pareto_y) > 1:
                             sorted_pareto = pareto_y[pareto_y[:, 0].argsort()]
                             plt.plot(sorted_pareto[:, 0], sorted_pareto[:, 1], '--')
+                
+                # Add a summary of point counts in the top-left corner
+                summary_text = "\n".join([f"{algo}: {counts['total']} total, {counts['pareto']} Pareto" 
+                                        for algo, counts in point_counts.items()])
+                plt.text(0.02, 0.98, summary_text, transform=plt.gca().transAxes, 
+                        fontsize=10, fontweight='bold', verticalalignment='top',
+                        bbox=dict(facecolor='white', alpha=0.8))
                 
                 plt.title(f'Pareto Front Comparison on {problem}')
                 plt.xlabel('Objective 1')
@@ -348,20 +506,77 @@ def compare_across_problems(problems, algorithms, budget, batch_size, output_dir
         # Create data for performance profiles
         # Organize data by algorithm and problem
         data_by_algo = {}
-        metrics = ['runtime', 'hypervolume', 'pareto_size']
+        metrics = ['runtime', 'hypervolume', 'pareto_size', 'total_points']
         
         for result in all_results:
             algo = result['algorithm']
             if algo not in data_by_algo:
-                data_by_algo[algo] = {'problems': [], 'runtime': [], 'hypervolume': [], 'pareto_size': []}
+                data_by_algo[algo] = {
+                    'problems': [], 
+                    'runtime': [], 
+                    'hypervolume': [], 
+                    'pareto_size': [],
+                    'total_points': [],
+                    'hypervolume_history': []
+                }
             
             data_by_algo[algo]['problems'].append(result['problem'])
             data_by_algo[algo]['runtime'].append(result['runtime'])
             data_by_algo[algo]['hypervolume'].append(result['hypervolume'])
             data_by_algo[algo]['pareto_size'].append(result['pareto_size'])
+            data_by_algo[algo]['total_points'].append(result.get('total_points', 0))
+            if 'hypervolume_history' in result:
+                data_by_algo[algo]['hypervolume_history'].append(result['hypervolume_history'])
         
-        # Create comparison plots across problems
-        # Average runtime by algorithm
+        # Plot average hypervolume convergence across problems
+        plt.figure(figsize=(12, 8))
+        for algo in algorithms:
+            if algo in data_by_algo and 'hypervolume_history' in data_by_algo[algo] and data_by_algo[algo]['hypervolume_history']:
+                # Find the maximum length of hypervolume history
+                histories = data_by_algo[algo]['hypervolume_history']
+                if not histories:
+                    continue
+                    
+                max_len = max([len(h) for h in histories if h])
+                if max_len == 0:
+                    continue
+                
+                # Pad shorter histories with their last value
+                padded_histories = []
+                for h in histories:
+                    if not h:
+                        continue
+                    history = h.copy()
+                    if len(history) < max_len:
+                        history.extend([history[-1]] * (max_len - len(history)))
+                    padded_histories.append(history)
+                
+                if not padded_histories:
+                    continue
+                
+                # Calculate average history
+                avg_history = np.mean(padded_histories, axis=0)
+                
+                # Plot average history
+                plt.plot(
+                    range(1, len(avg_history) + 1),
+                    avg_history,
+                    label=algo,
+                    marker='o',
+                    markersize=4,
+                    linewidth=2
+                )
+        
+        plt.title('Average Hypervolume Convergence Across All Problems')
+        plt.xlabel('Iteration')
+        plt.ylabel('Average Hypervolume')
+        plt.grid(True)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, 'avg_hypervolume_convergence.png'))
+        plt.close()
+        
+        # Create average runtime comparison
         plt.figure(figsize=(12, 8))
         avg_runtimes = [np.mean(data_by_algo[algo]['runtime']) for algo in algorithms]
         plt.bar(algorithms, avg_runtimes)
@@ -383,6 +598,17 @@ def compare_across_problems(problems, algorithms, budget, batch_size, output_dir
         plt.savefig(os.path.join(output_dir, 'avg_hypervolume_comparison.png'))
         plt.close()
         
+        # Average total points by algorithm 
+        plt.figure(figsize=(12, 8))
+        avg_points = [np.mean(data_by_algo[algo]['total_points']) for algo in algorithms]
+        plt.bar(algorithms, avg_points)
+        plt.title('Average Total Points Evaluated Across All Problems')
+        plt.xlabel('Algorithm')
+        plt.ylabel('Average Points Evaluated')
+        plt.grid(True, axis='y')
+        plt.savefig(os.path.join(output_dir, 'avg_points_comparison.png'))
+        plt.close()
+        
         # Create a heatmap comparing algorithms and problems
         if len(problems) > 1:
             for metric in metrics:
@@ -397,16 +623,18 @@ def compare_across_problems(problems, algorithms, budget, batch_size, output_dir
                                 if metric == 'runtime':
                                     # For runtime, lower is better
                                     data[i, j] = -result[metric]
-                                else:
+                                elif metric == 'total_points' and 'total_points' in result:
+                                    data[i, j] = result['total_points']
+                                elif metric in result:
                                     # For other metrics, higher is better
                                     data[i, j] = result[metric]
                                 break
                 
                 plt.imshow(data, cmap='viridis')
-                plt.colorbar(label=metric.capitalize())
+                plt.colorbar(label=metric.capitalize().replace('_', ' '))
                 plt.xticks(np.arange(len(problems)), problems, rotation=45)
                 plt.yticks(np.arange(len(algorithms)), algorithms)
-                plt.title(f'{metric.capitalize()} Comparison')
+                plt.title(f'{metric.capitalize().replace("_", " ")} Comparison')
                 plt.tight_layout()
                 plt.savefig(os.path.join(output_dir, f'{metric}_heatmap.png'))
                 plt.close()
@@ -419,25 +647,27 @@ def compare_across_problems(problems, algorithms, budget, batch_size, output_dir
             # Summary by algorithm
             f.write("Performance by Algorithm (averages)\n")
             f.write("-"*80 + "\n")
-            f.write(f"{'Algorithm':<10} {'Avg Runtime (s)':<15} {'Avg Hypervolume':<20} {'Avg Pareto Size':<15}\n")
+            f.write(f"{'Algorithm':<10} {'Avg Runtime (s)':<15} {'Avg Hypervolume':<20} {'Avg Pareto Size':<15} {'Avg Total Points':<15}\n")
             
             for algo in algorithms:
                 avg_runtime = np.mean(data_by_algo[algo]['runtime'])
                 avg_hv = np.mean(data_by_algo[algo]['hypervolume'])
                 avg_pareto_size = np.mean(data_by_algo[algo]['pareto_size'])
+                avg_total_points = np.mean(data_by_algo[algo]['total_points'])
                 
-                f.write(f"{algo:<10} {avg_runtime:<15.2f} {avg_hv:<20.6f} {avg_pareto_size:<15.2f}\n")
+                f.write(f"{algo:<10} {avg_runtime:<15.2f} {avg_hv:<20.6f} {avg_pareto_size:<15.2f} {avg_total_points:<15.2f}\n")
             
             f.write("\n\n")
             
             # Individual results
             f.write("All Results\n")
             f.write("-"*80 + "\n")
-            f.write(f"{'Algorithm':<10} {'Problem':<15} {'Runtime (s)':<15} {'Hypervolume':<15} {'Pareto Size':<15}\n")
+            f.write(f"{'Algorithm':<10} {'Problem':<15} {'Runtime (s)':<15} {'Hypervolume':<15} {'Pareto Size':<15} {'Total Points':<15}\n")
             
             for result in all_results:
+                total_pts = result.get('total_points', 0)
                 f.write(f"{result['algorithm']:<10} {result['problem']:<15} {result['runtime']:<15.2f} "
-                        f"{result['hypervolume']:<15.6f} {result['pareto_size']:<15}\n")
+                        f"{result['hypervolume']:<15.6f} {result['pareto_size']:<15} {total_pts:<15}\n")
 
 def main():
     parser = argparse.ArgumentParser(description='Unified benchmark for optimization algorithms')
@@ -451,6 +681,7 @@ def main():
     parser.add_argument('--compare', action='store_true', help='Compare multiple algorithms')
     parser.add_argument('--algorithms', type=str, nargs='+', default=['qnehvi', 'nsga2'], 
                         help='Algorithms to compare (when using --compare)')
+    parser.add_argument('--verbose', action='store_true', help='Enable verbose output')
     
     args = parser.parse_args()
     
@@ -474,7 +705,8 @@ def main():
                 algorithms=args.algorithms,
                 budget=args.budget,
                 batch_size=args.batch_size,
-                output_dir=args.output_dir
+                output_dir=args.output_dir,
+                verbose=args.verbose
             )
         else:
             # Compare algorithms on a single problem
@@ -483,7 +715,8 @@ def main():
                 algorithms=args.algorithms,
                 budget=args.budget,
                 batch_size=args.batch_size,
-                output_dir=args.output_dir
+                output_dir=args.output_dir,
+                verbose=args.verbose
             )
     elif args.algorithm:
         if args.problems:
@@ -494,7 +727,8 @@ def main():
                     problem_name=problem,
                     budget=args.budget,
                     batch_size=args.batch_size,
-                    output_dir=os.path.join(args.output_dir, problem) if args.output_dir else None
+                    output_dir=os.path.join(args.output_dir, problem) if args.output_dir else None,
+                    verbose=args.verbose
                 )
         else:
             # Run a single algorithm on a single problem
@@ -503,7 +737,8 @@ def main():
                 problem_name=args.problem,
                 budget=args.budget,
                 batch_size=args.batch_size,
-                output_dir=args.output_dir
+                output_dir=args.output_dir,
+                verbose=args.verbose
             )
     else:
         print("Please specify an algorithm with --algorithm or use --compare to compare algorithms")

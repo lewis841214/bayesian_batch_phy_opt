@@ -313,6 +313,16 @@ class QNEHVIHybrid(MultiObjectiveOptimizer):
         
         # Track evaluations and remaining budget
         self.evaluated_points = 0
+        
+        # Set default reference point if not provided
+        if self.ref_point is None:
+            self.ref_point = torch.ones(self.n_objectives) * 10.0
+        else:
+            # Convert to tensor and ensure proper shape
+            if isinstance(self.ref_point, list):
+                self.ref_point = torch.tensor(self.ref_point, dtype=torch.double).view(-1)
+            else:
+                self.ref_point = self.ref_point.view(-1)
     
     def _setup(self):
         """Initialize BoTorch components"""
@@ -321,15 +331,12 @@ class QNEHVIHybrid(MultiObjectiveOptimizer):
         self.train_x = torch.empty((0, len(self.parameter_space.parameters)), dtype=torch.double)
         self.train_y = torch.empty((0, self.n_objectives), dtype=torch.double)
         
-        # Set default reference point if not provided
-        if self.ref_point is None:
-            self.ref_point = torch.ones(self.n_objectives) * 10.0
-        else:
-            self.ref_point = torch.tensor(self.ref_point, dtype=torch.double)
+        # Define parameter space dimension
+        self.dim = len(self.parameter_space.parameters)
         
         # Initialize model
         self.models = None
-    
+        
     def _update_model(self):
         """Update the surrogate model with current training data"""
         start_time = time.time()
@@ -491,63 +498,228 @@ class QNEHVIHybrid(MultiObjectiveOptimizer):
             # Ensure alpha is a valid value (default to 1e-3 if None)
             alpha = 1e-3 if self.noise_std is None else self.noise_std
             
+            # Add detailed debugging information about tensor shapes
+            print(f"DEBUG - Train_y shape: {self.train_y.shape}")
+            print(f"DEBUG - Ref_point before adjustment: {self.ref_point}, shape: {self.ref_point.shape}")
+            
+            # Adjust reference point to match actual number of objectives if needed
+            y_dim = self.train_y.shape[1]
+            if self.ref_point.shape[0] != y_dim:
+                print(f"Warning: Reference point dimensions ({self.ref_point.shape[0]}) don't match problem objectives ({y_dim}). Adjusting.")
+                if y_dim > self.ref_point.shape[0]:
+                    # Expand reference point with default values
+                    new_ref = torch.ones(y_dim, dtype=torch.double) * 11.0
+                    new_ref[:self.ref_point.shape[0]] = self.ref_point
+                    self.ref_point = new_ref
+                else:
+                    # Truncate reference point
+                    self.ref_point = self.ref_point[:y_dim]
+            
+            print(f"DEBUG - Ref_point after adjustment: {self.ref_point}, shape: {self.ref_point.shape}")
+            print(f"DEBUG - X_baseline shape: {X_baseline.shape}")
+            
+            # Debug the mean and variance from the model wrapper
+            print("DEBUG - Testing model output shapes:")
+            
             # Create a wrapper for our models that looks like ModelListGP to BoTorch
+            class SingleModelWrapper(Model):
+                """Wrapper for a single model to ensure proper posterior formatting"""
+                def __init__(self, model):
+                    super().__init__()
+                    self.model = model
+                    
+                def posterior(self, X, observation_noise=False, **kwargs):
+                    """Get posterior from the model and ensure proper formatting"""
+                    try:
+                        posterior = self.model.posterior(X)
+                        mean = posterior.mean
+                        variance = posterior.variance
+                        
+                        batch_size = X.shape[0]
+                        
+                        # KEY FIX: BoTorch expects [batch_size, output_dim] tensors, not [batch_size, 1, 1]
+                        # Ensure proper shapes directly without reshaping the original tensors
+                        if mean.dim() == 3 and mean.shape[1] == 1 and mean.shape[2] == 1:
+                            # Shape is [batch_size, 1, 1] - flatten to [batch_size, 1]
+                            mean = mean.squeeze(-1)
+                        elif mean.dim() == 1:
+                            # Shape is [batch_size] - expand to [batch_size, 1]
+                            mean = mean.unsqueeze(-1)
+                            
+                        if variance.dim() == 3 and variance.shape[1] == 1 and variance.shape[2] == 1:
+                            # Shape is [batch_size, 1, 1] - flatten to [batch_size, 1]
+                            variance = variance.squeeze(-1)
+                        elif variance.dim() == 1:
+                            # Shape is [batch_size] - expand to [batch_size, 1]
+                            variance = variance.unsqueeze(-1)
+                        
+                        # Print the shapes for debugging
+                        print(f"DEBUG - Formatted mean shape: {mean.shape}, variance shape: {variance.shape}")
+                        
+                        # Use properly formatted tensors to create MVN
+                        # For BoTorch, we need a batch MVN with event shape [1]
+                        # Create a proper batched covariance matrix with shape [batch_size, 1, 1]
+                        covar_matrix = torch.zeros((batch_size, 1, 1), dtype=X.dtype, device=X.device)
+                        for i in range(batch_size):
+                            covar_matrix[i, 0, 0] = variance[i, 0]
+                        
+                        # Create the MVN
+                        mvn = MultivariateNormal(mean, covar_matrix)
+                        
+                        # Return a GPyTorchPosterior to ensure compatibility with BoTorch
+                        return GPyTorchPosterior(mvn)
+                        
+                    except Exception as e:
+                        print(f"Error in SingleModelWrapper: {e}")
+                        # Create a simple fallback posterior with the correct shape
+                        batch_size = X.shape[0]
+                        simple_mean = torch.zeros((batch_size, 1), dtype=X.dtype, device=X.device)
+                        simple_covar = torch.eye(1, dtype=X.dtype, device=X.device).expand(batch_size, 1, 1)
+                        simple_mvn = MultivariateNormal(simple_mean, simple_covar)
+                        return GPyTorchPosterior(simple_mvn)
+            
             class ModelListWrapper(Model):
                 def __init__(self, models):
                     super().__init__()
-                    self.models = models
+                    # Wrap each model individually to ensure proper posterior formatting
+                    self.models = [SingleModelWrapper(model) for model in models]
                     
                 def posterior(self, X, observation_noise=False, **kwargs):
                     """Return a combined posterior"""
+                    batch_size = X.shape[0]
+                    num_models = len(self.models)
+                    print(f"DEBUG - Processing posterior for batch size: {batch_size}, models: {num_models}")
+                    
                     # Get posteriors from all models
-                    posteriors = [model.posterior(X) for model in self.models]
+                    try:
+                        posteriors = [model.posterior(X) for model in self.models]
+                    except Exception as e:
+                        print(f"ERROR in model posterior: {e}")
+                        print(f"Input tensor shape: {X.shape}")
+                        raise ValueError(f"Failed to get posterior from models: {e}")
                     
-                    # Combine means and variances
-                    means = torch.cat([p.mean for p in posteriors], dim=-1)
-                    variances = torch.cat([p.variance for p in posteriors], dim=-1)
+                    # Debug posterior shapes
+                    print(f"DEBUG - Number of posteriors: {len(posteriors)}")
+                    for i, p in enumerate(posteriors):
+                        print(f"DEBUG - Posterior {i} mean shape: {p.mean.shape}, variance shape: {p.variance.shape}")
                     
-                    # Create a new multivariate normal distribution
-                    covar_matrix = torch.diag_embed(variances.squeeze(-1))
-                    mvn = MultivariateNormal(means, covar_matrix)
-                    
-                    return GPyTorchPosterior(mvn)
+                    # Extract and correctly format means and variances
+                    try:
+                        # KEY FIX: Create a joint posterior that BoTorch expects for multi-objective optimization
+                        # We need mean shape [batch_size, num_objectives] and proper covariance
+                        
+                        # Set up correctly shaped output tensors
+                        joint_mean = torch.zeros(batch_size, num_models, dtype=X.dtype, device=X.device)
+                        
+                        # Carefully extract means from each posterior and ensure they have correct shape
+                        for i, p in enumerate(posteriors):
+                            m = p.mean
+                            # Convert to consistent shape [batch_size, 1]
+                            if m.dim() == 3:  # [batch, 1, 1]
+                                m = m.squeeze(-1).squeeze(-1)
+                            elif m.dim() == 2 and m.shape[1] == 1:  # [batch, 1]
+                                m = m.squeeze(-1)
+                                
+                            # Copy to output tensor
+                            joint_mean[:, i] = m
+                            
+                        # Create independent batched joint covariance (no correlation between objectives)
+                        # Shape needed: [batch_size, num_objectives, num_objectives]
+                        joint_covar = torch.zeros(batch_size, num_models, num_models, 
+                                            dtype=X.dtype, device=X.device)
+                        
+                        # Fill in diagonal entries with variances
+                        for b in range(batch_size):
+                            for i in range(num_models):
+                                var = posteriors[i].variance
+                                
+                                # Extract variance properly based on its shape
+                                if var.dim() == 3:  # [batch, 1, 1]
+                                    v = var[b, 0, 0]
+                                elif var.dim() == 2:  # [batch, 1]
+                                    v = var[b, 0]
+                                else:  # [batch]
+                                    v = var[b]
+                                    
+                                # Set diagonal element
+                                joint_covar[b, i, i] = v
+                        
+                        # Create the multivariate normal distribution
+                        joint_mvn = MultivariateNormal(joint_mean, joint_covar)
+                        
+                        # Create the posterior
+                        joint_posterior = GPyTorchPosterior(joint_mvn)
+                        
+                        # Debug the joint posterior
+                        print(f"DEBUG - Joint posterior mean shape: {joint_posterior.mean.shape}")
+                        print(f"DEBUG - Joint posterior variance shape: {joint_posterior.variance.shape}")
+                        
+                        return joint_posterior
+                        
+                    except Exception as e:
+                        print(f"ERROR combining posteriors: {e}")
+                        print(f"Full error details: {str(e)}")
+                        
+                        # Fallback: Create a simple posterior with the right shape
+                        dummy_mean = torch.zeros(batch_size, num_models, dtype=X.dtype, device=X.device)
+                        dummy_covar = torch.eye(num_models, dtype=X.dtype, device=X.device).unsqueeze(0).expand(batch_size, -1, -1)
+                        dummy_mvn = MultivariateNormal(dummy_mean, dummy_covar)
+                        return GPyTorchPosterior(dummy_mvn)
             
             model_wrapper = ModelListWrapper(model_list)
             
+            # Debug the model wrapper with a test input
+            print("DEBUG - Testing model_wrapper with single input:")
+            with torch.no_grad():
+                # Use a test input with the correct dimensionality (same as X_baseline)
+                test_x = X_baseline[:1].clone()  # Take the first training example as test - this ensures correct dimensions
+                try:
+                    test_posterior = model_wrapper.posterior(test_x)
+                    print(f"DEBUG - Test posterior mean shape: {test_posterior.mean.shape}")
+                    print(f"DEBUG - Test posterior variance shape: {test_posterior.variance.shape}")
+                except Exception as e:
+                    print(f"Error testing model posterior: {e}")
+                    print("Model test failed, but continuing with acquisition function creation")
+            
+            # Convert ref_point to column vector if needed
+            ref_point_tensor = self.ref_point.clone().detach()
+            print(f"DEBUG - Final ref_point used in acq function: {ref_point_tensor}, shape: {ref_point_tensor.shape}")
+            
+            # Format alpha correctly
+            alpha_value = alpha if isinstance(alpha, list) else [alpha] * self.n_objectives
+            print(f"DEBUG - Alpha value: {alpha_value}")
+            
+            # Store the model list in self.models for potential fallback use
+            self.models = model_list
+            
             # Create the acquisition function with the sampler
-            acq_func = qNoisyExpectedHypervolumeImprovement(
-                model=model_wrapper,
-                ref_point=self.ref_point.clone().detach(),  # Proper tensor cloning
-                X_baseline=X_baseline,
-                prune_baseline=True,
-                alpha=alpha,
-                sampler=sampler,  # Use the created sampler
-            )
+            print("DEBUG - Creating acquisition function with parameters:")
+            print(f"  - model: {type(model_wrapper)}")
+            print(f"  - ref_point: {ref_point_tensor} (shape: {ref_point_tensor.shape})")
+            print(f"  - X_baseline: shape {X_baseline.shape}")
+            print(f"  - alpha: {alpha_value}")
+            
+            try:
+                acq_func = qNoisyExpectedHypervolumeImprovement(
+                    model=model_wrapper,
+                    ref_point=ref_point_tensor.tolist(),  # Convert to list for better compatibility
+                    X_baseline=X_baseline,
+                    prune_baseline=True,
+                    alpha=alpha_value,
+                    sampler=sampler,  # Use the created sampler
+                    cache_root=False,  # Disable caching to avoid potential issues
+                )
+            except Exception as e:
+                print(f"Error creating acquisition function: {e}")
+                print("Falling back to random sampling")
+                return self._random_candidates(effective_batch_size)
         except Exception as e:
             print(f"Error creating acquisition function: {e}")
-            # Fall back to random sampling
-            candidates = []
-            for _ in range(effective_batch_size):
-                random_params = {}
-                for name, config in self.parameter_space.parameters.items():
-                    if config['type'] == 'continuous':
-                        random_params[name] = config['bounds'][0] + np.random.random() * (config['bounds'][1] - config['bounds'][0])
-                    elif config['type'] == 'integer':
-                        random_params[name] = np.random.randint(config['bounds'][0], config['bounds'][1] + 1)
-                    elif config['type'] == 'categorical':
-                        # Get the available categories
-                        categories = config.get('categories', [])
-                        if not categories:
-                            categories = config.get('values', [])
-                        
-                        # Ensure we have categories to sample from
-                        if not categories:
-                            raise ValueError(f"No categories defined for parameter {name}")
-                            
-                        # Convert to regular Python string to avoid numpy string type issues
-                        random_params[name] = str(np.random.choice(categories))
-                candidates.append(random_params)
-            return candidates
+            print("Falling back to Thompson Sampling for this batch...")
+            
+            # Simply return random candidates as the last resort
+            print("Using random sampling as final fallback")
+            return self._random_candidates(effective_batch_size)
         
         # Optimize acquisition function
         print(f"Optimizing acquisition function to find {effective_batch_size} candidates...")
@@ -681,3 +853,28 @@ class QNEHVIHybrid(MultiObjectiveOptimizer):
     def _tensors_to_dicts(self, tensors):
         """Convert multiple tensor candidates to parameter dictionaries"""
         return [self.adapter.from_framework_format(x) for x in tensors] 
+
+    def _random_candidates(self, batch_size):
+        """Generate random candidates as fallback"""
+        candidates = []
+        for _ in range(batch_size):
+            random_params = {}
+            for name, config in self.parameter_space.parameters.items():
+                if config['type'] == 'continuous':
+                    random_params[name] = config['bounds'][0] + np.random.random() * (config['bounds'][1] - config['bounds'][0])
+                elif config['type'] == 'integer':
+                    random_params[name] = np.random.randint(config['bounds'][0], config['bounds'][1] + 1)
+                elif config['type'] == 'categorical':
+                    # Get the available categories
+                    categories = config.get('categories', [])
+                    if not categories:
+                        categories = config.get('values', [])
+                    
+                    # Ensure we have categories to sample from
+                    if not categories:
+                        raise ValueError(f"No categories defined for parameter {name}")
+                        
+                    # Convert to regular Python string to avoid numpy string type issues
+                    random_params[name] = str(np.random.choice(categories))
+            candidates.append(random_params)
+        return candidates 
