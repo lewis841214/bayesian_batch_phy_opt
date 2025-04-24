@@ -386,8 +386,8 @@ class ComplexCategoryEmbeddingProblem(TestProblem):
     
     def __init__(self, n_embed=12):
         # Number of parameters and options
-        self.num_params = 5
-        self.num_options = 3
+        self.num_params = 4
+        self.num_options = 5
         self.n_embed = n_embed
         
         # Seed for reproducibility

@@ -87,6 +87,11 @@ class EvolutionaryAdapter(AlgorithmAdapter):
         self.max_gen = 0
         self.evaluated_x = []
         self.evaluated_y = []
+        # Keep a separate history of all unique evaluations
+        self.all_evaluated_x = []
+        self.all_evaluated_y = []
+        # Dictionary to track unique evaluations (for faster lookup)
+        self.evaluation_cache = {}
     
     def setup(self, problem, budget, batch_size):
         """Setup evolutionary optimizer using pymoo interfaces"""
@@ -180,11 +185,41 @@ class EvolutionaryAdapter(AlgorithmAdapter):
         self.batch_size = batch_size
         self.current_gen = 0
         
+        # Reset tracking variables
+        self.evaluated_x = []
+        self.evaluated_y = []
+        self.all_evaluated_x = []
+        self.all_evaluated_y = []
+        self.evaluation_cache = {}
+        
         # Run first generation to initialize
         self._run_generation()
         
         return self
     
+    def _create_parameter_key(self, params):
+        """Create a unique key for parameter dictionary for caching"""
+        # Sort keys to ensure consistent ordering
+        keys = sorted(params.keys())
+        return tuple((k, params[k]) for k in keys)
+    
+    def _is_duplicate(self, params):
+        """Check if parameters have been evaluated before"""
+        key = self._create_parameter_key(params)
+        return key in self.evaluation_cache
+    
+    def _add_evaluation(self, params, f_value):
+        """Add evaluation to history if it's unique"""
+        key = self._create_parameter_key(params)
+        
+        # Only add if it's not a duplicate
+        if key not in self.evaluation_cache:
+            self.evaluation_cache[key] = len(self.all_evaluated_y)  # Store index for faster lookup
+            self.all_evaluated_x.append(params)
+            self.all_evaluated_y.append(f_value)
+            return True
+        return False
+
     def _create_algorithm(self):
         """Create a fresh instance of the algorithm"""
         from pymoo.operators.sampling.lhs import LHS
@@ -237,7 +272,7 @@ class EvolutionaryAdapter(AlgorithmAdapter):
         X = res.pop.get("X")
         F = res.pop.get("F") * -1  # Unnegate
         
-        # Update evaluation history
+        # Update current population
         self.evaluated_x = []
         self.evaluated_y = []
         
@@ -253,8 +288,12 @@ class EvolutionaryAdapter(AlgorithmAdapter):
                     cat_idx = int(round(float(X[i, j])))
                     x_params[name] = self.pymoo_problem.categorical_mappings[j][cat_idx]
             
+            # Add to current population
             self.evaluated_x.append(x_params)
             self.evaluated_y.append(F[i].tolist())
+            
+            # Add to all-time history if unique
+            self._add_evaluation(x_params, F[i].tolist())
             
         return res
     
@@ -267,6 +306,10 @@ class EvolutionaryAdapter(AlgorithmAdapter):
     
     def tell(self, x, y):
         """Update with evaluated solutions and run the next generation"""
+        # Add new evaluations to history if they're unique
+        for i in range(len(x)):
+            self._add_evaluation(x[i], y[i])
+            
         # Increment generation counter
         self.current_gen += 1
         
@@ -285,16 +328,16 @@ class EvolutionaryAdapter(AlgorithmAdapter):
         """Return current Pareto front"""
         from pymoo.util.nds.non_dominated_sorting import NonDominatedSorting
         
-        # Find non-dominated solutions
-        if len(self.evaluated_y) == 0:
+        # Find non-dominated solutions from all unique evaluations
+        if len(self.all_evaluated_y) == 0:
             return [], []
         
-        F = -1 * np.array(self.evaluated_y)  # Negate for sorting
+        F = -1 * np.array(self.all_evaluated_y)  # Negate for sorting
         nds = NonDominatedSorting().do(F, only_non_dominated_front=True)
         
         # Extract Pareto front
-        pareto_x = [self.evaluated_x[i] for i in nds]
-        pareto_y = [self.evaluated_y[i] for i in nds]
+        pareto_x = [self.all_evaluated_x[i] for i in nds]
+        pareto_y = [self.all_evaluated_y[i] for i in nds]
         
         return pareto_x, pareto_y
     
@@ -302,7 +345,7 @@ class EvolutionaryAdapter(AlgorithmAdapter):
         """Calculate hypervolume of current Pareto front"""
         from pymoo.indicators.hv import Hypervolume
         
-        if len(self.evaluated_y) == 0:
+        if len(self.all_evaluated_y) == 0:
             return 0.0
             
         # Get Pareto front
