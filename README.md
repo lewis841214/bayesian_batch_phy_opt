@@ -49,7 +49,7 @@ python tests/test_algorithms/unified_benchmark.py --algorithm nsga2 --problem ca
 ```
 
 ``` # test a batch
- python tests/test_algorithms/unified_benchmark.py --compare --algorithms nsga2 moead nsga3 qnehvi   --problem complex_categorical --budget 500 --batch-size 20 --output-dir output/complex_categorical_comparison_all
+ python tests/test_algorithms/unified_benchmark.py --compare --algorithms nsga2 moead nsga3 qnehvi nn-qnehvi xgb-qnehvi   --problem complex_categorical --budget 500 --batch-size 20 --output-dir output/complex_categorical_comparison_all
 
 ```
 

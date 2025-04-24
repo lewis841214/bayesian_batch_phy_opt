@@ -316,22 +316,32 @@ class EvolutionaryAdapter(AlgorithmAdapter):
         return hv.do(F)
 
 
-def get_algorithm_adapter(algorithm_name):
-    """Get appropriate adapter for algorithm name"""
+def get_algorithm_adapter(algorithm_name: str) -> AlgorithmAdapter:
+    """Get algorithm adapter based on name"""
+    algorithm_name = algorithm_name.lower()
+    
     # Bayesian optimization algorithms
-    if algorithm_name.lower() == 'qnehvi':
+    if algorithm_name == 'qnehvi':
         return BayesianOptAdapter(QNEHVI)
-    elif algorithm_name.lower() == 'qehvi':
+    elif algorithm_name == 'qehvi':
         return BayesianOptAdapter(QEHVI)
-    elif algorithm_name.lower() == 'qparego':
+    elif algorithm_name == 'qparego':
         return BayesianOptAdapter(QNParEGO)
     
     # Evolutionary algorithms
-    elif algorithm_name.lower() == 'nsga2':
+    elif algorithm_name == 'nsga2':
         return EvolutionaryAdapter(PyMOO_NSGA2)
-    elif algorithm_name.lower() == 'moead':
+    elif algorithm_name == 'moead':
         return EvolutionaryAdapter(PyMOO_MOEAD)
-    elif algorithm_name.lower() == 'nsga3':
+    elif algorithm_name == 'nsga3':
         return EvolutionaryAdapter(PyMOO_NSGA3)
+    
+    # Special case for hybrid methods
+    elif algorithm_name == 'nn-qnehvi':
+        from src.adapters.qnehvi_hybrid_adapter import QNEHVIHybridAdapter
+        return QNEHVIHybridAdapter(surrogate_model="nn")
+    elif algorithm_name == 'xgb-qnehvi':
+        from src.adapters.qnehvi_hybrid_adapter import QNEHVIHybridAdapter
+        return QNEHVIHybridAdapter(surrogate_model="xgboost")
     else:
         raise ValueError(f"Unknown algorithm: {algorithm_name}") 
