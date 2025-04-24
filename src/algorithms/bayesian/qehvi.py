@@ -15,6 +15,10 @@ from botorch.acquisition.multi_objective.monte_carlo import qExpectedHypervolume
 from botorch.optim.optimize import optimize_acqf
 from botorch.sampling.normal import SobolQMCNormalSampler
 from botorch.utils.multi_objective.box_decompositions.dominated import DominatedPartitioning
+from botorch.utils.sampling import draw_sobol_samples
+from pymoo.indicators.hv import HV
+import time
+from tqdm import tqdm
 
 from src.core.algorithm import MultiObjectiveOptimizer
 from src.core.parameter_space import ParameterSpace
@@ -60,6 +64,13 @@ class QEHVI(MultiObjectiveOptimizer):
         self.ref_point = ref_point
         self.noise_std = noise_std
         super().__init__(parameter_space, budget, batch_size, n_objectives)
+        
+        # Track timings for progress estimation
+        self.timing_history = {
+            'model_update': [],
+            'acquisition_optimization': [],
+            'iteration': []
+        }
     
     def _setup(self):
         """Initialize BoTorch components"""
@@ -79,72 +90,110 @@ class QEHVI(MultiObjectiveOptimizer):
     
     def _update_model(self):
         """Update the model with current training data"""
-        if len(self.train_x) == 0:
-            return
+        start_time = time.time()
         
-        # Normalize inputs to [0, 1]
-        bounds = self.bounds.transpose(0, 1)
-        train_x_normalized = normalize(self.train_x, bounds)
+        if len(self.train_x) < 2:
+            # Not enough data to fit a GP
+            return None
+            
+        # Normalize inputs - fix bounds format
+        bounds_t = self.bounds.transpose(0, 1)  # Make it (n_dims, 2)
+        X = normalize(self.train_x, bounds_t)
+        Y = self.train_y
         
-        # Initialize models for each objective
+        print(f"Fitting GP model with {len(X)} observations...")
+        
+        # Create and fit a model for each objective
         models = []
-        for i in range(self.n_objectives):
-            train_y_i = self.train_y[:, i:i+1]
+        
+        for i in tqdm(range(self.n_objectives), desc="Fitting GP models"):
+            y = Y[:, i:i+1]  # Get ith objective, keep dimension
             
             # Configure noise if known
-            if self.noise_std is not None:
-                train_yvar = torch.full_like(train_y_i, self.noise_std[i] ** 2)
-                model = SingleTaskGP(
-                    train_x_normalized, 
-                    train_y_i, 
-                    train_yvar,
-                    outcome_transform=Standardize(m=1)
-                )
+            if self.noise_std is not None and isinstance(self.noise_std, list):
+                noise_var = torch.full_like(y, self.noise_std[i] ** 2)
+                model = SingleTaskGP(X, y, noise_var, outcome_transform=Standardize(m=1))
             else:
-                model = SingleTaskGP(
-                    train_x_normalized, 
-                    train_y_i,
-                    outcome_transform=Standardize(m=1)
-                )
-            
+                model = SingleTaskGP(X, y, outcome_transform=Standardize(m=1))
+                
+            mll = ExactMarginalLogLikelihood(model.likelihood, model)
+            fit_gpytorch_mll(mll)
             models.append(model)
         
-        # Create a model list and fit
-        self.model = ModelListGP(*models)
-        mll = SumMarginalLogLikelihood(self.model.likelihood, self.model)
-        fit_gpytorch_mll(mll)
-    
-    def ask(self, n: Optional[int] = None) -> List[Dict[str, Any]]:
-        """Return batch of points to evaluate using qEHVI acquisition"""
-        n = n or self.batch_size
-        
-        # If we don't have enough data to fit a model, sample randomly
-        if len(self.train_x) < 2 * self.n_objectives:
-            # Generate Sobol samples in the parameter space
-            sobol = torch.quasirandom.SobolEngine(dimension=len(self.parameter_space.parameters))
-            samples = sobol.draw(n)
-            # Scale to bounds
-            bounds = self.bounds.transpose(0, 1)
-            samples = bounds[0] + (bounds[1] - bounds[0]) * samples
+        # Create a ModelListGP
+        model_list = ModelListGP(*models)
             
-            # Convert to parameter dictionaries
-            return [self.adapter.from_framework_format(x) for x in samples]
+        elapsed = time.time() - start_time
+        self.timing_history['model_update'].append(elapsed)
+        print(f"Model fitting completed in {elapsed:.2f} seconds")
         
-        # Update model with current data
-        self._update_model()
+        return model_list
+    
+    def ask(self):
+        """Return a batch of points to evaluate"""
+        # If we don't have enough points, generate random samples
+        if len(self.train_x) < 2 * self.n_objectives:
+            print("Insufficient data for GP model. Using random sampling.")
+            
+            # Generate candidates directly using the parameter space
+            candidates = []
+            for _ in range(self.batch_size):
+                random_params = {}
+                # Sample each parameter type appropriately
+                for name, config in self.parameter_space.parameters.items():
+                    if config['type'] == 'continuous':
+                        # Sample continuous uniform
+                        random_params[name] = config['bounds'][0] + np.random.random() * (config['bounds'][1] - config['bounds'][0])
+                    elif config['type'] == 'integer':
+                        # Sample integer uniform
+                        random_params[name] = np.random.randint(config['bounds'][0], config['bounds'][1] + 1)
+                    elif config['type'] == 'categorical':
+                        # Sample categorical uniform
+                        random_params[name] = np.random.choice(config['categories'])
+                candidates.append(random_params)
+                
+            return candidates
         
-        # Normalize inputs
-        bounds = self.bounds.transpose(0, 1)
-        train_x_normalized = normalize(self.train_x, bounds)
+        # Update GP models
+        model_list = self._update_model()
+        
+        if model_list is None:
+            # Fall back to random sampling
+            candidates = []
+            for _ in range(self.batch_size):
+                random_params = {}
+                # Sample each parameter type appropriately
+                for name, config in self.parameter_space.parameters.items():
+                    if config['type'] == 'continuous':
+                        # Sample continuous uniform
+                        random_params[name] = config['bounds'][0] + np.random.random() * (config['bounds'][1] - config['bounds'][0])
+                    elif config['type'] == 'integer':
+                        # Sample integer uniform
+                        random_params[name] = np.random.randint(config['bounds'][0], config['bounds'][1] + 1)
+                    elif config['type'] == 'categorical':
+                        # Sample categorical uniform
+                        random_params[name] = np.random.choice(config['values'])
+                candidates.append(random_params)
+                
+            return candidates
+        
+        start_time = time.time()
+        
+        # Create the acquisition function
+        print("Creating qEHVI acquisition function...")
+        
+        # Normalize inputs for acquisition function
+        bounds_t = self.bounds.transpose(0, 1)
+        X_baseline = normalize(self.train_x, bounds_t)
         
         try:
             # Get model predictions at training points
             with torch.no_grad():
-                pred = self.model.posterior(train_x_normalized).mean
+                pred = model_list.posterior(X_baseline).mean
             
             # Partition non-dominated space using FastNondominatedPartitioning
             partitioning = FastNondominatedPartitioning(
-                ref_point=self.ref_point,
+                ref_point=self.ref_point.clone().detach(),
                 Y=pred,
             )
             
@@ -153,42 +202,60 @@ class QEHVI(MultiObjectiveOptimizer):
             
             # Create qEHVI acquisition function
             acq_func = qExpectedHypervolumeImprovement(
-                model=self.model,
-                ref_point=self.ref_point,
+                model=model_list,
+                ref_point=self.ref_point.clone().detach(),
                 partitioning=partitioning,
                 sampler=sampler,
             )
             
-            # Create standard [0,1] bounds for optimization
-            standard_bounds = torch.zeros(2, train_x_normalized.shape[1], dtype=torch.double)
+            # Optimize acquisition function
+            print(f"Optimizing acquisition function to find {self.batch_size} candidates...")
+            
+            # Use standard bounds [0, 1] for optimization
+            standard_bounds = torch.zeros(2, X_baseline.shape[1], dtype=torch.double)
             standard_bounds[1] = 1.0
             
-            # Optimize acquisition function
-            candidates, _ = optimize_acqf(
+            # Initialize with Sobol samples for better starting points
+            n_samples = 1000
+            sobol_samples = draw_sobol_samples(bounds=standard_bounds, n=n_samples, q=self.batch_size).squeeze(0)
+            
+            # Optimize from multiple random starting points to avoid local optima
+            n_restarts = 5
+            raw_samples = 100
+            
+            candidates, acq_values = optimize_acqf(
                 acq_function=acq_func,
                 bounds=standard_bounds,
-                q=n,
-                num_restarts=10,
-                raw_samples=512,
+                q=self.batch_size,
+                num_restarts=n_restarts,
+                raw_samples=raw_samples,
                 options={"batch_limit": 5, "maxiter": 200},
                 sequential=True,
             )
+            print(f"Acquisition value: {acq_values.item():.6f}")
             
             # Unnormalize candidates
-            candidates = unnormalize(candidates.detach(), bounds)
+            candidates = unnormalize(candidates.detach(), bounds_t)
             
         except Exception as e:
             print(f"Error in acquisition function optimization: {str(e)}")
-            # Fall back to random sampling
-            sobol = torch.quasirandom.SobolEngine(dimension=len(self.parameter_space.parameters))
-            samples = sobol.draw(n)
-            candidates = bounds[0] + (bounds[1] - bounds[0]) * samples
+            # Fall back to random sampling or use most recent points
+            candidates = self.train_x[-self.batch_size:]
         
-        # Convert to parameter dictionaries
-        return [self.adapter.from_framework_format(x) for x in candidates]
+        elapsed = time.time() - start_time
+        self.timing_history['acquisition_optimization'].append(elapsed)
+        print(f"Acquisition optimization completed in {elapsed:.2f} seconds")
+        
+        # Convert tensor to dictionaries
+        candidate_dicts = self._tensors_to_dicts(candidates)
+        
+        # Return a batch of candidates
+        return candidate_dicts
     
     def tell(self, xs: List[Dict[str, Any]], ys: List[List[float]]):
         """Update model with evaluated points"""
+        start_time = time.time()
+        
         # Convert parameter dictionaries to tensors
         x_tensors = []
         for x in xs:
@@ -216,6 +283,35 @@ class QEHVI(MultiObjectiveOptimizer):
         # Add to training data
         self.train_x = torch.cat([self.train_x, x_tensor])
         self.train_y = torch.cat([self.train_y, y_tensor])
+        
+        elapsed = time.time() - start_time
+        self.timing_history['iteration'].append(elapsed)
+        
+        # Provide timing estimates for next iteration
+        avg_model_time = 0.0
+        avg_acq_time = 0.0
+        avg_iter_time = 0.0
+        
+        if len(self.timing_history['model_update']) > 0:
+            avg_model_time = np.mean(self.timing_history['model_update'])
+            print(f"Average model update time: {avg_model_time:.2f} seconds")
+            
+        if len(self.timing_history['acquisition_optimization']) > 0:
+            avg_acq_time = np.mean(self.timing_history['acquisition_optimization'])
+            print(f"Average acquisition optimization time: {avg_acq_time:.2f} seconds")
+            
+        if len(self.timing_history['iteration']) > 0:
+            avg_iter_time = np.mean(self.timing_history['iteration'])
+            print(f"Average iteration time: {avg_iter_time:.2f} seconds")
+            
+        # Estimate remaining time
+        remaining_steps = (self.budget - len(self.train_x)) / self.batch_size
+        est_remaining_time = remaining_steps * (avg_model_time + avg_acq_time + avg_iter_time)
+        print(f"Estimated remaining time: {est_remaining_time:.2f} seconds ({est_remaining_time/60:.2f} minutes)")
+    
+    def _tensors_to_dicts(self, tensors):
+        """Convert multiple tensor candidates to parameter dictionaries"""
+        return [self.adapter.from_framework_format(x) for x in tensors]
     
     def recommend(self) -> Tuple[List[Dict[str, Any]], List[List[float]]]:
         """Return current Pareto front"""

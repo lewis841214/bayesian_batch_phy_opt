@@ -38,44 +38,47 @@ class BoTorchAdapter(FrameworkAdapter):
             'continuous_dims': continuous_dims
         }
     
-    def from_framework_format(self, framework_params):
-        """Convert BoTorch tensor to standard dictionary"""
-        result = {}
+    def from_framework_format(self, params_array):
+        """Convert tensor params to a dict of parameter values"""
+        if isinstance(params_array, torch.Tensor):
+            # Ensure we're working with a 1D tensor
+            params_array = params_array.squeeze()
+            if params_array.dim() > 1:
+                # If still multidimensional after squeeze, it's a batch
+                # Just take the first element for now
+                params_array = params_array[0]
+
+        params_dict = {}
+        idx = 0
         
-        # Check if framework_params is a tensor or a dictionary
-        if isinstance(framework_params, torch.Tensor):
-            # Convert tensor to numpy array for processing
-            params_array = framework_params.cpu().numpy()
-            
-            # Map each parameter back to its original space
-            idx = 0
-            for name, param_config in self.parameter_space.parameters.items():
-                if param_config['type'] == 'continuous':
-                    result[name] = float(params_array[idx])
-                    idx += 1
-                elif param_config['type'] == 'integer':
-                    # Round to nearest integer
-                    result[name] = int(round(float(params_array[idx])))
-                    idx += 1
-                elif param_config['type'] == 'categorical':
-                    # Map integer back to category
-                    cat_idx = int(round(float(params_array[idx])))
-                    cat_map = self.botorch_space['categorical_maps'][name]['map']
-                    result[name] = cat_map[cat_idx]
-                    idx += 1
-        else:
-            # It's already a dictionary, just ensure types are correct
-            for name, param_config in self.parameter_space.parameters.items():
-                if name in framework_params:
-                    value = framework_params[name]
-                    if param_config['type'] == 'continuous':
-                        result[name] = float(value)
-                    elif param_config['type'] == 'integer':
-                        result[name] = int(round(float(value)))
-                    elif param_config['type'] == 'categorical':
-                        result[name] = value
-        
-        return result
+        # Extract parameter values from ordered tensor
+        for name, config in self.parameter_space.parameters.items():
+            if config['type'] in ['continuous', 'integer']:
+                # Continuous and integer parameters map directly
+                val = float(params_array[idx])
+                if config['type'] == 'integer':
+                    val = int(round(val))
+                params_dict[name] = val
+                idx += 1
+            elif config['type'] == 'categorical':
+                # Categorical parameters need to be mapped back to categorical values
+                try:
+                    # Handle scalar values
+                    if isinstance(params_array[idx], torch.Tensor):
+                        cat_idx = int(round(float(params_array[idx].item())))
+                    else:
+                        cat_idx = int(round(float(params_array[idx])))
+                    
+                    # Ensure cat_idx is in valid range
+                    cat_idx = max(0, min(cat_idx, len(config['categories']) - 1))
+                    params_dict[name] = config['categories'][cat_idx]
+                except Exception as e:
+                    # Fallback to the first option if there's an error
+                    print(f"Error mapping categorical value for {name}: {e}")
+                    params_dict[name] = config['categories'][0]
+                idx += 1
+                
+        return params_dict
     
     def convert_results(self, framework_results):
         """Convert BoTorch optimization results to standard format"""

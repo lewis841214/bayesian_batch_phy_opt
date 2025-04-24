@@ -6,6 +6,7 @@ import os
 import numpy as np
 import matplotlib.pyplot as plt
 from typing import Dict, List, Any, Tuple, Optional, Union, Type
+from tqdm import tqdm
 
 # Add the project root to the path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
@@ -34,16 +35,22 @@ def run_optimization(algorithm_name, problem_name, budget, batch_size, output_di
     all_evaluated_x = []
     all_evaluated_y = []
     
+    # Create progress bar for overall optimization
+    pbar = tqdm(total=budget, desc=f"Optimizing with {algorithm_name}", 
+                unit="evaluations", leave=True)
+    
+    iteration = 0
     while remaining_budget > 0:
         # Determine batch size for this iteration
         current_batch = min(batch_size, remaining_budget)
         
         # Get candidates
+        tqdm.write(f"\nIteration {iteration+1}: Requesting {current_batch} candidates...")
         candidates = adapter.ask()
         
         # Evaluate candidates
         values = []
-        for candidate in candidates[:current_batch]:  # Ensure we respect batch size
+        for i, candidate in enumerate(tqdm(candidates[:current_batch], desc="Evaluating candidates", leave=False)):
             value = problem.evaluate(candidate)
             values.append(value)
             
@@ -52,10 +59,20 @@ def run_optimization(algorithm_name, problem_name, budget, batch_size, output_di
             all_evaluated_y.append(value)
         
         # Update algorithm
+        tqdm.write(f"Updating model with {current_batch} evaluations...")
         adapter.tell(candidates[:current_batch], values)
         
-        # Update budget
+        # Update budget and progress bar
         remaining_budget -= current_batch
+        pbar.update(current_batch)
+        
+        # Print some info about current best point
+        if hasattr(adapter, 'get_hypervolume'):
+            tqdm.write(f"Current hypervolume: {adapter.get_hypervolume():.6f}")
+        
+        iteration += 1
+    
+    pbar.close()
     
     # Get final results
     pareto_x, pareto_y = adapter.get_result()
@@ -97,6 +114,10 @@ def run_optimization(algorithm_name, problem_name, budget, batch_size, output_di
             
             plt.savefig(os.path.join(output_dir, f'{algorithm_name}_{problem_name}_pareto.png'))
             plt.close()
+            
+            # Save raw data for later analysis
+            np.save(os.path.join(output_dir, f'{algorithm_name}_{problem_name}_pareto_y.npy'), pareto_ys)
+            np.save(os.path.join(output_dir, f'{algorithm_name}_{problem_name}_all_y.npy'), all_ys)
         
         elif problem.num_objectives == 3:
             fig = plt.figure(figsize=(10, 8))
