@@ -92,26 +92,40 @@ def run_optimization(algorithm_name, problem_name, budget, batch_size, output_di
         os.makedirs(output_dir, exist_ok=True)
         
         if problem.num_objectives == 2:
-            plt.figure(figsize=(10, 6))
+            # Create figure with proper layout for colorbar
+            fig, ax = plt.subplots(figsize=(10, 6))
             
-            # Plot all evaluated points with lower opacity
+            # Plot all evaluated points with alpha scaling by recency
             if len(all_ys) > 0:
-                plt.scatter(all_ys[:, 0], all_ys[:, 1], color='blue', alpha=0.3, label='All evaluated points')
+                # Use colormap to show progression of evaluations
+                n_points = len(all_ys)
+                
+                # Create a scatter plot with a color gradient
+                scatter = ax.scatter(all_ys[:, 0], all_ys[:, 1], 
+                                    c=np.arange(n_points),
+                                    cmap='Blues',
+                                    alpha=0.7, 
+                                    label='Evaluated points')
+                
+                # Add a color bar to show progression (using the figure and specific axes)
+                cbar = fig.colorbar(scatter, ax=ax)
+                cbar.set_label('Evaluation order')
             
             # Plot Pareto front with higher opacity
-            plt.scatter(pareto_ys[:, 0], pareto_ys[:, 1], color='red', label='Pareto front')
+            ax.scatter(pareto_ys[:, 0], pareto_ys[:, 1], color='red', label='Pareto front')
             
             # Sort for line if more than one point
             if len(pareto_ys) > 1:
                 sorted_pareto = pareto_ys[pareto_ys[:, 0].argsort()]
-                plt.plot(sorted_pareto[:, 0], sorted_pareto[:, 1], 'r--')
+                ax.plot(sorted_pareto[:, 0], sorted_pareto[:, 1], 'r--')
             
-            plt.title(f'Pareto Front: {algorithm_name} on {problem_name}')
-            plt.xlabel('Objective 1')
-            plt.ylabel('Objective 2')
-            plt.legend()
-            plt.grid(True)
+            ax.set_title(f'Pareto Front: {algorithm_name} on {problem_name}')
+            ax.set_xlabel('Objective 1')
+            ax.set_ylabel('Objective 2')
+            ax.legend()
+            ax.grid(True)
             
+            plt.tight_layout()
             plt.savefig(os.path.join(output_dir, f'{algorithm_name}_{problem_name}_pareto.png'))
             plt.close()
             
@@ -123,9 +137,21 @@ def run_optimization(algorithm_name, problem_name, budget, batch_size, output_di
             fig = plt.figure(figsize=(10, 8))
             ax = fig.add_subplot(111, projection='3d')
             
-            # Plot all evaluated points with lower opacity
+            # Plot all evaluated points with color scaling by recency
             if len(all_ys) > 0:
-                ax.scatter(all_ys[:, 0], all_ys[:, 1], all_ys[:, 2], c='blue', alpha=0.3, label='All evaluated points')
+                # Use colormap to show progression of evaluations
+                n_points = len(all_ys)
+                
+                # Create a scatter plot with a color gradient
+                scatter = ax.scatter(all_ys[:, 0], all_ys[:, 1], all_ys[:, 2], 
+                                    c=np.arange(n_points), 
+                                    cmap='Blues',
+                                    alpha=0.7,
+                                    label='Evaluated points')
+                
+                # Add a color bar to show progression
+                cbar = fig.colorbar(scatter, ax=ax)
+                cbar.set_label('Evaluation order')
             
             # Plot Pareto front with higher opacity
             ax.scatter(pareto_ys[:, 0], pareto_ys[:, 1], pareto_ys[:, 2], c='r', marker='o', label='Pareto front')
@@ -136,6 +162,7 @@ def run_optimization(algorithm_name, problem_name, budget, batch_size, output_di
             ax.set_title(f'Pareto Front: {algorithm_name} on {problem_name}')
             ax.legend()
             
+            plt.tight_layout()
             plt.savefig(os.path.join(output_dir, f'{algorithm_name}_{problem_name}_pareto3d.png'))
             plt.close()
     

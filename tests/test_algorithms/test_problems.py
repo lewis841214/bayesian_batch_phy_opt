@@ -386,8 +386,8 @@ class ComplexCategoryEmbeddingProblem(TestProblem):
     
     def __init__(self, n_embed=12):
         # Number of parameters and options
-        self.num_params = 15
-        self.num_options = 4
+        self.num_params = 8
+        self.num_options = 3
         self.n_embed = n_embed
         
         # Seed for reproducibility
@@ -502,19 +502,19 @@ class ComplexCategoryEmbeddingProblem(TestProblem):
         objectives[0] = 100 * np.exp(np.sin(weighted_sums1) + self.b_final[0]) 
         objectives[1] = 100 * np.exp(np.cos(weighted_sums2) + self.b_final[1])
         
-        # Additional non-linear interaction between objectives
-        # This creates a more interesting Pareto front shape
-        objectives[0] += 10 * np.sin(weighted_sums2 * 1.5)
-        objectives[1] += 10 * np.cos(weighted_sums1 * 1.5)
+        # # Additional non-linear interaction between objectives
+        # # This creates a more interesting Pareto front shape
+        # objectives[0] += 10 * np.sin(weighted_sums2 * 1.5)
+        # objectives[1] += 10 * np.cos(weighted_sums1 * 1.5)
         
-        # Make the objectives even more conflicting
-        shared_term = np.sum(embedding_matrix[:, half_embed//2:half_embed])
-        objectives[0] += 50 * np.sin(shared_term)
-        objectives[1] += 50 * np.cos(shared_term)
+        # # Make the objectives even more conflicting
+        # shared_term = np.sum(embedding_matrix[:, half_embed//2:half_embed])
+        # objectives[0] += 50 * np.sin(shared_term)
+        # objectives[1] += 50 * np.cos(shared_term)
         
-        # Scale objectives to create more diversity
-        objectives[0] = 200 + objectives[0] * 50
-        objectives[1] = 200 + objectives[1] * 50
+        # # Scale objectives to create more diversity
+        # objectives[0] = 200 + objectives[0] * 50
+        # objectives[1] = 200 + objectives[1] * 50
         
         return objectives.tolist()
     
