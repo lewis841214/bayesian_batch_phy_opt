@@ -251,17 +251,17 @@ class QNEHVI(MultiObjectiveOptimizer):
         print(f"Optimizing acquisition function to find {effective_batch_size} candidates...")
         
         # Initialize with Sobol samples
-        n_samples = 1000
+        # n_samples = 1000
         
         # Use standard bounds [0, 1] for optimization
         standard_bounds = torch.zeros(2, X_baseline.shape[1], dtype=torch.double)
         standard_bounds[1] = 1.0
         
-        sobol_samples = draw_sobol_samples(bounds=standard_bounds, n=n_samples, q=effective_batch_size).squeeze(0)
+        # sobol_samples = draw_sobol_samples(bounds=standard_bounds, n=n_samples, q=effective_batch_size).squeeze(0)
         
         # Optimize from multiple random starting points to avoid local optima
-        n_restarts = 5
-        raw_samples = 100
+        n_restarts = 3
+        raw_samples = 50
         
         try:
             candidates, acq_values = optimize_acqf(
@@ -270,7 +270,7 @@ class QNEHVI(MultiObjectiveOptimizer):
                 q=effective_batch_size,
                 num_restarts=n_restarts,
                 raw_samples=raw_samples,
-                options={"batch_limit": 5, "maxiter": 200},
+                options={"batch_limit": 5, "maxiter": 100},
                 sequential=True,
             )
             print(f"Acquisition value: {acq_values.item():.6f}")
