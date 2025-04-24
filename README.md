@@ -35,6 +35,10 @@ pip install -r requirements.txt
 
 ## Quick Start
 
+``` # to test multiple problems with multiple optimization algorithm
+
+python tests/test_algorithms/unified_benchmark.py --compare --algorithms qnehvi qehvi qparego nsga2 moead nsga3 --problems nonlinear constrained --budget 20 --batch-size 5 --output-dir output/multi_problem_benchmark
+```
 Here's a simple example of using the q-EHVI algorithm on a multi-objective problem:
 
 ```python

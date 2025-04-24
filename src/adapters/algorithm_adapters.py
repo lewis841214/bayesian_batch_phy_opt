@@ -83,10 +83,13 @@ class EvolutionaryAdapter(AlgorithmAdapter):
         self.algorithm_class = algorithm_class
         self.algorithm_params = algorithm_params or {}
         self.algorithm = None
-        self.problem = None
-        self.population = None
+        self.pymoo_problem = None
+        self.current_gen = 0
+        self.max_gen = 0
         self.evaluated_x = []
         self.evaluated_y = []
+        self.progress = {}
+        self.is_initialized = False
     
     def setup(self, problem, budget, batch_size):
         """Setup evolutionary optimizer using pymoo interfaces"""
@@ -95,6 +98,7 @@ class EvolutionaryAdapter(AlgorithmAdapter):
         from pymoo.operators.crossover.sbx import SBX
         from pymoo.operators.mutation.pm import PM
         from pymoo.util.ref_dirs import get_reference_directions
+        from pymoo.termination.max_gen import MaximumGenerationTermination
         
         # Create pymoo problem wrapper
         class PymooProblem(Problem):
@@ -157,8 +161,13 @@ class EvolutionaryAdapter(AlgorithmAdapter):
                 out["F"] = np.array(f_values) * -1  # Negate for maximization
         
         # Setup problem wrapper
-        self.problem = PymooProblem(problem)
+        self.test_problem = problem
+        self.pymoo_problem = PymooProblem(problem)
         self.ref_point = np.array(problem.get_reference_point()) * -1  # Negate for maximization
+        
+        # Calculate generations based on budget and batch size
+        self.max_gen = budget // batch_size
+        self.termination = MaximumGenerationTermination(n_max_gen=self.max_gen)
         
         # Set up algorithm specific parameters
         if self.algorithm_class == PyMOO_NSGA3:
@@ -189,68 +198,116 @@ class EvolutionaryAdapter(AlgorithmAdapter):
                 **self.algorithm_params
             )
         
-        # Initialize population
-        from pymoo.optimize import minimize
-        res = minimize(
-            self.problem,
-            self.algorithm,
-            termination=('n_gen', 1),  # Just initialize
-            seed=42,
-            save_history=False,
-            verbose=False
-        )
-        
-        self.generation = 0
-        self.budget = budget
+        self.current_gen = 0
         self.batch_size = batch_size
         
+        # Initialize algorithm with problem
+        self.algorithm.setup(self.pymoo_problem)
+        
+        # Create initial population manually
+        from pymoo.core.population import Population
+        pop = self.algorithm.initialization.do(self.pymoo_problem, self.algorithm.pop_size)
+        
+        # Evaluate initial population
+        self.pymoo_problem.evaluate(pop, out={"F": None})
+        
+        # Set the algorithm's population
+        self.algorithm.pop = pop
+        
+        # Store population data
+        self._update_evaluations()
+        
+        self.is_initialized = True
         return self
+    
+    def _update_evaluations(self):
+        """Update the evaluation history from current population"""
+        # Extract X and F from population
+        if self.algorithm.pop is None:
+            return
+            
+        X = self.algorithm.pop.get("X")
+        F = self.algorithm.pop.get("F") * -1  # Unnegate
+        
+        if X is None or F is None:
+            return
+        
+        # Convert to parameter dictionaries
+        self.evaluated_x = []
+        self.evaluated_y = []
+        
+        for i in range(len(X)):
+            x_params = {}
+            for j, name in enumerate(self.pymoo_problem.param_names):
+                if self.pymoo_problem.param_types[j] == 'continuous':
+                    x_params[name] = float(X[i, j])
+                elif self.pymoo_problem.param_types[j] == 'integer':
+                    x_params[name] = int(round(float(X[i, j])))
+                elif self.pymoo_problem.param_types[j] == 'categorical':
+                    cat_idx = int(round(float(X[i, j])))
+                    x_params[name] = self.pymoo_problem.categorical_mappings[j][cat_idx]
+            
+            self.evaluated_x.append(x_params)
+            self.evaluated_y.append(F[i].tolist())
     
     def ask(self):
         """Get current population as candidates"""
-        from pymoo.core.population import Population
+        if not self.is_initialized or not self.algorithm or not self.algorithm.pop:
+            return []
         
-        if self.algorithm.pop is None:
-            # Get initial population from the algorithm
-            pop = self.algorithm.initialization.do(self.problem, self.algorithm.pop_size)
-            self.algorithm.pop = pop
-        else:
-            # Get current population
-            pop = self.algorithm.pop
+        X = self.algorithm.pop.get("X")
+        if X is None:
+            return []
         
         # Convert to parameter dictionaries
         candidates = []
-        for i in range(len(pop)):
-            x = pop[i].X
-            params = {}
-            for j, name in enumerate(self.problem.param_names):
-                if self.problem.param_types[j] == 'continuous':
-                    params[name] = float(x[j])
-                elif self.problem.param_types[j] == 'integer':
-                    params[name] = int(round(float(x[j])))
-                elif self.problem.param_types[j] == 'categorical':
-                    cat_idx = int(round(float(x[j])))
-                    params[name] = self.problem.categorical_mappings[j][cat_idx]
-            candidates.append(params)
+        for i in range(len(X)):
+            x_params = {}
+            for j, name in enumerate(self.pymoo_problem.param_names):
+                if self.pymoo_problem.param_types[j] == 'continuous':
+                    x_params[name] = float(X[i, j])
+                elif self.pymoo_problem.param_types[j] == 'integer':
+                    x_params[name] = int(round(float(X[i, j])))
+                elif self.pymoo_problem.param_types[j] == 'categorical':
+                    cat_idx = int(round(float(X[i, j])))
+                    x_params[name] = self.pymoo_problem.categorical_mappings[j][cat_idx]
+            
+            candidates.append(x_params)
         
         return candidates
     
     def tell(self, x, y):
-        """Update with evaluated solutions"""
-        # Store evaluated solutions
-        self.evaluated_x.extend(x)
-        self.evaluated_y.extend(y)
+        """Update with evaluated solutions and run the next generation"""
+        # Check if properly initialized before continuing
+        if not self.is_initialized:
+            raise RuntimeError("Algorithm not properly initialized. Call setup() first.")
+            
+        # Increment generation counter
+        self.current_gen += 1
         
-        # Convert objectives to numpy array (negated for maximization)
-        F = -1 * np.array(y)
-        
-        # Set F values in current population
+        if self.current_gen >= self.max_gen:
+            return
+           
+        # Set current population's F values directly (already evaluated externally)
+        F = -1 * np.array(y)  # Negate for maximization
         for i in range(len(self.algorithm.pop)):
-            self.algorithm.pop[i].F = F[i]
+            self.algorithm.pop[i].set("F", F[i])
         
-        # Run evolutionary operators to get next generation
-        self.algorithm.next()
-        self.generation += 1
+        # Advance to the next generation without using deepcopy
+        try:
+            # This performs mating and generates offspring
+            self.algorithm.mating.do(self.algorithm.problem, self.algorithm.pop, self.algorithm.n_offsprings, algorithm=self.algorithm)
+            
+            # Store newly evaluated solutions
+            self._update_evaluations()
+            
+            # Create new population for next generation
+            self.algorithm.next()
+            
+        except Exception as e:
+            print(f"Error in evolutionary algorithm: {str(e)}")
+            import traceback
+            traceback.print_exc()
     
     def get_result(self):
         """Return current Pareto front"""
@@ -260,7 +317,7 @@ class EvolutionaryAdapter(AlgorithmAdapter):
         if len(self.evaluated_y) == 0:
             return [], []
         
-        F = -1 * np.array(self.evaluated_y)  # Negate back to original values
+        F = -1 * np.array(self.evaluated_y)  # Negate for sorting
         nds = NonDominatedSorting().do(F, only_non_dominated_front=True)
         
         # Extract Pareto front

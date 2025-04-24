@@ -45,8 +45,9 @@ def run_optimization(algorithm_name, problem_name, budget, batch_size, output_di
             values.append(value)
         
         # Update algorithm
-        adapter.tell(candidates[:current_batch], values)
         
+        adapter.tell(candidates[:current_batch], values)
+        print(type(candidates))
         # Update budget
         remaining_budget -= current_batch
     
@@ -181,10 +182,198 @@ def compare_algorithms(problem_name, algorithms, budget, batch_size, output_dir=
             plt.grid(True)
             plt.savefig(os.path.join(output_dir, f'pareto_comparison_{problem_name}.png'))
             plt.close()
+    
+    return results
+
+def compare_across_problems(problems, algorithms, budget, batch_size, output_dir=None):
+    """Compare algorithms across multiple problems"""
+    all_results = []
+    
+    for problem in problems:
+        # Run each algorithm separately on this problem instead of all at once
+        problem_results = []
+        for algorithm_name in algorithms:
+            print(f"\nRunning {algorithm_name} on {problem}")
+            # Get a fresh instance of the algorithm adapter for each problem-algorithm pair
+            adapter = get_algorithm_adapter(algorithm_name)
+            problem_obj = get_test_problem(problem)
+            adapter.setup(problem_obj, budget, batch_size)
+            
+            # Run optimization for this algorithm
+            result = run_optimization(
+                algorithm_name=algorithm_name,
+                problem_name=problem,
+                budget=budget,
+                batch_size=batch_size,
+                output_dir=os.path.join(output_dir, problem) if output_dir else None
+            )
+            problem_results.append(result)
+            
+        # Print comparison table for this problem
+        print("\n" + "="*80)
+        print(f"Comparison on {problem}")
+        print("="*80)
+        print(f"{'Algorithm':<10} {'Runtime (s)':<15} {'Hypervolume':<15} {'Pareto Size':<15}")
+        print("-"*80)
+        
+        for result in problem_results:
+            print(f"{result['algorithm']:<10} {result['runtime']:<15.2f} {result['hypervolume']:<15.6f} {result['pareto_size']:<15}")
+            
+        # Add results to overall results
+        all_results.extend(problem_results)
+        
+        # Plot comparisons for this problem
+        if output_dir:
+            problem_dir = os.path.join(output_dir, problem)
+            os.makedirs(problem_dir, exist_ok=True)
+            
+            # Bar chart for runtimes
+            plt.figure(figsize=(10, 6))
+            plt.bar(
+                [r['algorithm'] for r in problem_results],
+                [r['runtime'] for r in problem_results]
+            )
+            plt.title(f'Runtime Comparison on {problem}')
+            plt.xlabel('Algorithm')
+            plt.ylabel('Runtime (seconds)')
+            plt.grid(True, axis='y')
+            plt.savefig(os.path.join(problem_dir, f'runtime_comparison_{problem}.png'))
+            plt.close()
+            
+            # Bar chart for hypervolumes
+            plt.figure(figsize=(10, 6))
+            plt.bar(
+                [r['algorithm'] for r in problem_results],
+                [r['hypervolume'] for r in problem_results]
+            )
+            plt.title(f'Hypervolume Comparison on {problem}')
+            plt.xlabel('Algorithm')
+            plt.ylabel('Hypervolume')
+            plt.grid(True, axis='y')
+            plt.savefig(os.path.join(problem_dir, f'hypervolume_comparison_{problem}.png'))
+            plt.close()
+            
+            # If 2-objective problem, plot all Pareto fronts
+            problem_obj = get_test_problem(problem)
+            if problem_obj.num_objectives == 2:
+                plt.figure(figsize=(10, 6))
+                
+                for result in problem_results:
+                    pareto_y = np.array(result['pareto_y'])
+                    if len(pareto_y) > 0:
+                        plt.scatter(pareto_y[:, 0], pareto_y[:, 1], label=result['algorithm'])
+                        if len(pareto_y) > 1:
+                            sorted_pareto = pareto_y[pareto_y[:, 0].argsort()]
+                            plt.plot(sorted_pareto[:, 0], sorted_pareto[:, 1], '--')
+                
+                plt.title(f'Pareto Front Comparison on {problem}')
+                plt.xlabel('Objective 1')
+                plt.ylabel('Objective 2')
+                plt.legend()
+                plt.grid(True)
+                plt.savefig(os.path.join(problem_dir, f'pareto_comparison_{problem}.png'))
+                plt.close()
+    
+    # Create summary table and plots across all problems
+    if output_dir:
+        # Create data for performance profiles
+        # Organize data by algorithm and problem
+        data_by_algo = {}
+        metrics = ['runtime', 'hypervolume', 'pareto_size']
+        
+        for result in all_results:
+            algo = result['algorithm']
+            if algo not in data_by_algo:
+                data_by_algo[algo] = {'problems': [], 'runtime': [], 'hypervolume': [], 'pareto_size': []}
+            
+            data_by_algo[algo]['problems'].append(result['problem'])
+            data_by_algo[algo]['runtime'].append(result['runtime'])
+            data_by_algo[algo]['hypervolume'].append(result['hypervolume'])
+            data_by_algo[algo]['pareto_size'].append(result['pareto_size'])
+        
+        # Create comparison plots across problems
+        # Average runtime by algorithm
+        plt.figure(figsize=(12, 8))
+        avg_runtimes = [np.mean(data_by_algo[algo]['runtime']) for algo in algorithms]
+        plt.bar(algorithms, avg_runtimes)
+        plt.title('Average Runtime Across All Problems')
+        plt.xlabel('Algorithm')
+        plt.ylabel('Average Runtime (seconds)')
+        plt.grid(True, axis='y')
+        plt.savefig(os.path.join(output_dir, 'avg_runtime_comparison.png'))
+        plt.close()
+        
+        # Average hypervolume by algorithm 
+        plt.figure(figsize=(12, 8))
+        avg_hv = [np.mean(data_by_algo[algo]['hypervolume']) for algo in algorithms]
+        plt.bar(algorithms, avg_hv)
+        plt.title('Average Hypervolume Across All Problems')
+        plt.xlabel('Algorithm')
+        plt.ylabel('Average Hypervolume')
+        plt.grid(True, axis='y')
+        plt.savefig(os.path.join(output_dir, 'avg_hypervolume_comparison.png'))
+        plt.close()
+        
+        # Create a heatmap comparing algorithms and problems
+        if len(problems) > 1:
+            for metric in metrics:
+                plt.figure(figsize=(12, 8))
+                data = np.zeros((len(algorithms), len(problems)))
+                
+                for i, algo in enumerate(algorithms):
+                    for j, problem in enumerate(problems):
+                        # Find the result for this algorithm-problem pair
+                        for result in all_results:
+                            if result['algorithm'] == algo and result['problem'] == problem:
+                                if metric == 'runtime':
+                                    # For runtime, lower is better
+                                    data[i, j] = -result[metric]
+                                else:
+                                    # For other metrics, higher is better
+                                    data[i, j] = result[metric]
+                                break
+                
+                plt.imshow(data, cmap='viridis')
+                plt.colorbar(label=metric.capitalize())
+                plt.xticks(np.arange(len(problems)), problems, rotation=45)
+                plt.yticks(np.arange(len(algorithms)), algorithms)
+                plt.title(f'{metric.capitalize()} Comparison')
+                plt.tight_layout()
+                plt.savefig(os.path.join(output_dir, f'{metric}_heatmap.png'))
+                plt.close()
+        
+        # Create summary table in a text file
+        with open(os.path.join(output_dir, 'summary.txt'), 'w') as f:
+            f.write("Performance Summary Across All Problems\n")
+            f.write("="*80 + "\n\n")
+            
+            # Summary by algorithm
+            f.write("Performance by Algorithm (averages)\n")
+            f.write("-"*80 + "\n")
+            f.write(f"{'Algorithm':<10} {'Avg Runtime (s)':<15} {'Avg Hypervolume':<20} {'Avg Pareto Size':<15}\n")
+            
+            for algo in algorithms:
+                avg_runtime = np.mean(data_by_algo[algo]['runtime'])
+                avg_hv = np.mean(data_by_algo[algo]['hypervolume'])
+                avg_pareto_size = np.mean(data_by_algo[algo]['pareto_size'])
+                
+                f.write(f"{algo:<10} {avg_runtime:<15.2f} {avg_hv:<20.6f} {avg_pareto_size:<15.2f}\n")
+            
+            f.write("\n\n")
+            
+            # Individual results
+            f.write("All Results\n")
+            f.write("-"*80 + "\n")
+            f.write(f"{'Algorithm':<10} {'Problem':<15} {'Runtime (s)':<15} {'Hypervolume':<15} {'Pareto Size':<15}\n")
+            
+            for result in all_results:
+                f.write(f"{result['algorithm']:<10} {result['problem']:<15} {result['runtime']:<15.2f} "
+                        f"{result['hypervolume']:<15.6f} {result['pareto_size']:<15}\n")
 
 def main():
     parser = argparse.ArgumentParser(description='Unified benchmark for optimization algorithms')
     parser.add_argument('--problem', type=str, default='constrained', help='Test problem to optimize')
+    parser.add_argument('--problems', type=str, nargs='+', help='Multiple test problems to optimize')
     parser.add_argument('--algorithm', type=str, help='Specific algorithm to use (qnehvi, qehvi, qparego, nsga2, moead, nsga3)')
     parser.add_argument('--budget', type=int, default=50, help='Evaluation budget')
     parser.add_argument('--batch-size', type=int, default=4, help='Batch size')
@@ -209,23 +398,46 @@ def main():
     
     # Run comparison or single algorithm
     if args.compare:
-        compare_algorithms(
-            problem_name=args.problem,
-            algorithms=args.algorithms,
-            budget=args.budget,
-            batch_size=args.batch_size,
-            output_dir=args.output_dir
-        )
+        if args.problems:
+            # Compare algorithms across multiple problems
+            compare_across_problems(
+                problems=args.problems,
+                algorithms=args.algorithms,
+                budget=args.budget,
+                batch_size=args.batch_size,
+                output_dir=args.output_dir
+            )
+        else:
+            # Compare algorithms on a single problem
+            compare_algorithms(
+                problem_name=args.problem,
+                algorithms=args.algorithms,
+                budget=args.budget,
+                batch_size=args.batch_size,
+                output_dir=args.output_dir
+            )
     elif args.algorithm:
-        run_optimization(
-            algorithm_name=args.algorithm,
-            problem_name=args.problem,
-            budget=args.budget,
-            batch_size=args.batch_size,
-            output_dir=args.output_dir
-        )
+        if args.problems:
+            # Run a single algorithm on multiple problems
+            for problem in args.problems:
+                run_optimization(
+                    algorithm_name=args.algorithm,
+                    problem_name=problem,
+                    budget=args.budget,
+                    batch_size=args.batch_size,
+                    output_dir=os.path.join(args.output_dir, problem) if args.output_dir else None
+                )
+        else:
+            # Run a single algorithm on a single problem
+            run_optimization(
+                algorithm_name=args.algorithm,
+                problem_name=args.problem,
+                budget=args.budget,
+                batch_size=args.batch_size,
+                output_dir=args.output_dir
+            )
     else:
         print("Please specify an algorithm with --algorithm or use --compare to compare algorithms")
 
 if __name__ == '__main__':
-    main() 
+    main()
