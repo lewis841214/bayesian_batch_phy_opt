@@ -48,6 +48,11 @@ python tests/test_algorithms/unified_benchmark.py --compare --algorithms nsga2 m
 python tests/test_algorithms/unified_benchmark.py --algorithm nsga2 --problem category_matrix --budget 50 --batch-size 10 --output-dir output/category_matrix_nsga2
 ```
 
+``` # test a batch
+ python tests/test_algorithms/unified_benchmark.py --compare --algorithms nsga2 moead nsga3 qnehvi   --problem complex_categorical --budget 500 --batch-size 20 --output-dir output/complex_categorical_comparison_all
+
+```
+
 ```# test all problems, all algorithm
 python tests/test_algorithms/batch_benchmark.py --budget 50 --batch-size 10 --output-dir output/full_comparison_50_10
 ```

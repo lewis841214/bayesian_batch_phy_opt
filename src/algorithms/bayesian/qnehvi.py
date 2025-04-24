@@ -72,6 +72,9 @@ class QNEHVI(MultiObjectiveOptimizer):
             'acquisition_optimization': [],
             'iteration': []
         }
+        
+        # Track evaluations and remaining budget
+        self.evaluated_points = 0
     
     def _setup(self):
         """Initialize BoTorch components"""
@@ -125,13 +128,23 @@ class QNEHVI(MultiObjectiveOptimizer):
     
     def ask(self):
         """Return a batch of points to evaluate"""
+        # Calculate remaining budget and effective batch size
+        remaining = self.budget - self.evaluated_points
+        effective_batch_size = min(self.batch_size, remaining)
+        
+        if effective_batch_size <= 0:
+            print("Budget exhausted, no more evaluations possible.")
+            return []
+            
+        print(f"Generating batch of {effective_batch_size} candidates. Remaining budget: {remaining}")
+        
         # If we don't have enough points, generate random samples
         if len(self.train_x) < 2 * self.n_objectives:
             print("Insufficient data for GP model. Using random sampling.")
             
             # Generate candidates directly using the parameter space
             candidates = []
-            for _ in range(self.batch_size):
+            for _ in range(effective_batch_size):
                 random_params = {}
                 # Sample each parameter type appropriately
                 for name, config in self.parameter_space.parameters.items():
@@ -143,7 +156,10 @@ class QNEHVI(MultiObjectiveOptimizer):
                         random_params[name] = np.random.randint(config['bounds'][0], config['bounds'][1] + 1)
                     elif config['type'] == 'categorical':
                         # Sample categorical uniform
-                        random_params[name] = np.random.choice(config['categories'])
+                        if 'categories' in config:
+                            random_params[name] = np.random.choice(config['categories'])
+                        else:
+                            random_params[name] = np.random.choice(config['values'])
                 candidates.append(random_params)
                 
             return candidates
@@ -155,7 +171,7 @@ class QNEHVI(MultiObjectiveOptimizer):
             # Fall back to random sampling
             # Generate candidates directly using the parameter space
             candidates = []
-            for _ in range(self.batch_size):
+            for _ in range(effective_batch_size):
                 random_params = {}
                 # Sample each parameter type appropriately
                 for name, config in self.parameter_space.parameters.items():
@@ -167,7 +183,10 @@ class QNEHVI(MultiObjectiveOptimizer):
                         random_params[name] = np.random.randint(config['bounds'][0], config['bounds'][1] + 1)
                     elif config['type'] == 'categorical':
                         # Sample categorical uniform
-                        random_params[name] = np.random.choice(config['values'])
+                        if 'categories' in config:
+                            random_params[name] = np.random.choice(config['categories'])
+                        else:
+                            random_params[name] = np.random.choice(config['values'])
                 candidates.append(random_params)
                 
             return candidates
@@ -213,7 +232,7 @@ class QNEHVI(MultiObjectiveOptimizer):
             print(f"Error creating acquisition function: {e}")
             # Fall back to random sampling
             candidates = []
-            for _ in range(self.batch_size):
+            for _ in range(effective_batch_size):
                 random_params = {}
                 for name, config in self.parameter_space.parameters.items():
                     if config['type'] == 'continuous':
@@ -221,12 +240,15 @@ class QNEHVI(MultiObjectiveOptimizer):
                     elif config['type'] == 'integer':
                         random_params[name] = np.random.randint(config['bounds'][0], config['bounds'][1] + 1)
                     elif config['type'] == 'categorical':
-                        random_params[name] = np.random.choice(config['categories'])
+                        if 'categories' in config:
+                            random_params[name] = np.random.choice(config['categories'])
+                        else:
+                            random_params[name] = np.random.choice(config['values'])
                 candidates.append(random_params)
             return candidates
         
         # Optimize acquisition function
-        print(f"Optimizing acquisition function to find {self.batch_size} candidates...")
+        print(f"Optimizing acquisition function to find {effective_batch_size} candidates...")
         
         # Initialize with Sobol samples
         n_samples = 1000
@@ -235,7 +257,7 @@ class QNEHVI(MultiObjectiveOptimizer):
         standard_bounds = torch.zeros(2, X_baseline.shape[1], dtype=torch.double)
         standard_bounds[1] = 1.0
         
-        sobol_samples = draw_sobol_samples(bounds=standard_bounds, n=n_samples, q=self.batch_size).squeeze(0)
+        sobol_samples = draw_sobol_samples(bounds=standard_bounds, n=n_samples, q=effective_batch_size).squeeze(0)
         
         # Optimize from multiple random starting points to avoid local optima
         n_restarts = 5
@@ -245,7 +267,7 @@ class QNEHVI(MultiObjectiveOptimizer):
             candidates, acq_values = optimize_acqf(
                 acq_function=acq_func,
                 bounds=standard_bounds,
-                q=self.batch_size,
+                q=effective_batch_size,
                 num_restarts=n_restarts,
                 raw_samples=raw_samples,
                 options={"batch_limit": 5, "maxiter": 200},
@@ -258,7 +280,25 @@ class QNEHVI(MultiObjectiveOptimizer):
             
         except Exception as e:
             print(f"Error in acquisition optimization: {e}. Using random samples.")
-            candidates = self.train_x[-self.batch_size:]  # Use recent points as candidates
+            # Generate random samples instead
+            candidates = []
+            for _ in range(effective_batch_size):
+                random_params = {}
+                for name, config in self.parameter_space.parameters.items():
+                    if config['type'] == 'continuous':
+                        random_params[name] = config['bounds'][0] + np.random.random() * (config['bounds'][1] - config['bounds'][0])
+                    elif config['type'] == 'integer':
+                        random_params[name] = np.random.randint(config['bounds'][0], config['bounds'][1] + 1)
+                    elif config['type'] == 'categorical':
+                        if 'categories' in config:
+                            random_params[name] = np.random.choice(config['categories'])
+                        else:
+                            random_params[name] = np.random.choice(config['values'])
+                candidates.append(random_params)
+            
+            # Convert to tensor format
+            candidate_dicts = candidates
+            return candidate_dicts
         
         elapsed = time.time() - start_time
         self.timing_history['acquisition_optimization'].append(elapsed)
@@ -267,11 +307,15 @@ class QNEHVI(MultiObjectiveOptimizer):
         # Convert tensor to dictionaries
         candidate_dicts = self._tensors_to_dicts(candidates)
         
-        # Return a batch of candidates
-        return candidate_dicts
+        # Return a batch of candidates (ensuring we don't exceed batch size)
+        return candidate_dicts[:effective_batch_size]
     
     def tell(self, xs: List[Dict[str, Any]], ys: List[List[float]]):
         """Update model with evaluated points"""
+        # Update budget tracking
+        self.evaluated_points += len(xs)
+        print(f"Tell called with {len(xs)} points. Total evaluated: {self.evaluated_points}/{self.budget}")
+        
         # Convert parameter dictionaries to tensors
         x_tensors = []
         for x in xs:
