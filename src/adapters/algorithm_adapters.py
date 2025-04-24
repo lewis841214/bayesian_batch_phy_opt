@@ -82,14 +82,11 @@ class EvolutionaryAdapter(AlgorithmAdapter):
         """Initialize with algorithm class and optional parameters"""
         self.algorithm_class = algorithm_class
         self.algorithm_params = algorithm_params or {}
-        self.algorithm = None
         self.pymoo_problem = None
         self.current_gen = 0
         self.max_gen = 0
         self.evaluated_x = []
         self.evaluated_y = []
-        self.progress = {}
-        self.is_initialized = False
     
     def setup(self, problem, budget, batch_size):
         """Setup evolutionary optimizer using pymoo interfaces"""
@@ -98,7 +95,6 @@ class EvolutionaryAdapter(AlgorithmAdapter):
         from pymoo.operators.crossover.sbx import SBX
         from pymoo.operators.mutation.pm import PM
         from pymoo.util.ref_dirs import get_reference_directions
-        from pymoo.termination.max_gen import MaximumGenerationTermination
         
         # Create pymoo problem wrapper
         class PymooProblem(Problem):
@@ -140,18 +136,32 @@ class EvolutionaryAdapter(AlgorithmAdapter):
             
             def _evaluate(self, x, out, *args, **kwargs):
                 # Convert to problem's parameter format
-                n_points = x.shape[0]
+                # Handle different input types
+                from pymoo.core.individual import Individual
+                
+                # Check if input is a list/array of Individual objects
+                if isinstance(x[0], Individual):
+                    # Extract X values from individuals
+                    X = np.array([ind.X for ind in x])
+                else:
+                    X = x
+                
+                # Ensure X is 2D even if only one solution
+                if X.ndim == 1:
+                    X = X.reshape(1, -1)
+                
+                n_points = X.shape[0]
                 f_values = []
                 
                 for i in range(n_points):
                     params = {}
                     for j, name in enumerate(self.param_names):
                         if self.param_types[j] == 'continuous':
-                            params[name] = float(x[i, j])
+                            params[name] = float(X[i, j])
                         elif self.param_types[j] == 'integer':
-                            params[name] = int(round(float(x[i, j])))
+                            params[name] = int(round(float(X[i, j])))
                         elif self.param_types[j] == 'categorical':
-                            cat_idx = int(round(float(x[i, j])))
+                            cat_idx = int(round(float(X[i, j])))
                             params[name] = self.categorical_mappings[j][cat_idx]
                     
                     # Evaluate
@@ -167,13 +177,25 @@ class EvolutionaryAdapter(AlgorithmAdapter):
         
         # Calculate generations based on budget and batch size
         self.max_gen = budget // batch_size
-        self.termination = MaximumGenerationTermination(n_max_gen=self.max_gen)
+        self.batch_size = batch_size
+        self.current_gen = 0
         
-        # Set up algorithm specific parameters
+        # Run first generation to initialize
+        self._run_generation()
+        
+        return self
+    
+    def _create_algorithm(self):
+        """Create a fresh instance of the algorithm"""
+        from pymoo.operators.sampling.lhs import LHS
+        from pymoo.operators.crossover.sbx import SBX
+        from pymoo.operators.mutation.pm import PM
+        from pymoo.util.ref_dirs import get_reference_directions
+        
         if self.algorithm_class == PyMOO_NSGA3:
-            ref_dirs = get_reference_directions("das-dennis", problem.num_objectives, n_partitions=12)
-            self.algorithm = self.algorithm_class(
-                pop_size=batch_size,
+            ref_dirs = get_reference_directions("das-dennis", self.test_problem.num_objectives, n_partitions=12)
+            return self.algorithm_class(
+                pop_size=self.batch_size,
                 sampling=LHS(),
                 crossover=SBX(prob=0.9, eta=15),
                 mutation=PM(eta=20),
@@ -181,8 +203,8 @@ class EvolutionaryAdapter(AlgorithmAdapter):
                 **self.algorithm_params
             )
         elif self.algorithm_class == PyMOO_MOEAD:
-            ref_dirs = get_reference_directions("das-dennis", problem.num_objectives, n_partitions=12)
-            self.algorithm = self.algorithm_class(
+            ref_dirs = get_reference_directions("das-dennis", self.test_problem.num_objectives, n_partitions=12)
+            return self.algorithm_class(
                 sampling=LHS(),
                 crossover=SBX(prob=0.9, eta=15),
                 mutation=PM(eta=20),
@@ -190,52 +212,36 @@ class EvolutionaryAdapter(AlgorithmAdapter):
                 **self.algorithm_params
             )
         else:  # Default (NSGA2)
-            self.algorithm = self.algorithm_class(
-                pop_size=batch_size,
+            return self.algorithm_class(
+                pop_size=self.batch_size,
                 sampling=LHS(),
                 crossover=SBX(prob=0.9, eta=15),
                 mutation=PM(eta=20),
                 **self.algorithm_params
             )
-        
-        self.current_gen = 0
-        self.batch_size = batch_size
-        
-        # Initialize algorithm with problem
-        self.algorithm.setup(self.pymoo_problem)
-        
-        # Create initial population manually
-        from pymoo.core.population import Population
-        pop = self.algorithm.initialization.do(self.pymoo_problem, self.algorithm.pop_size)
-        
-        # Evaluate initial population
-        self.pymoo_problem.evaluate(pop, out={"F": None})
-        
-        # Set the algorithm's population
-        self.algorithm.pop = pop
-        
-        # Store population data
-        self._update_evaluations()
-        
-        self.is_initialized = True
-        return self
     
-    def _update_evaluations(self):
-        """Update the evaluation history from current population"""
-        # Extract X and F from population
-        if self.algorithm.pop is None:
-            return
-            
-        X = self.algorithm.pop.get("X")
-        F = self.algorithm.pop.get("F") * -1  # Unnegate
+    def _run_generation(self):
+        """Run a single generation of the evolutionary algorithm"""
+        from pymoo.optimize import minimize
         
-        if X is None or F is None:
-            return
+        algorithm = self._create_algorithm()
+        res = minimize(
+            self.pymoo_problem,
+            algorithm,
+            termination=('n_gen', self.current_gen + 1),
+            seed=42,
+            verbose=False
+        )
         
-        # Convert to parameter dictionaries
+        # Extract and store results
+        X = res.pop.get("X")
+        F = res.pop.get("F") * -1  # Unnegate
+        
+        # Update evaluation history
         self.evaluated_x = []
         self.evaluated_y = []
         
+        # Convert all evaluations to parameter dictionaries
         for i in range(len(X)):
             x_params = {}
             for j, name in enumerate(self.pymoo_problem.param_names):
@@ -249,61 +255,27 @@ class EvolutionaryAdapter(AlgorithmAdapter):
             
             self.evaluated_x.append(x_params)
             self.evaluated_y.append(F[i].tolist())
+            
+        return res
     
     def ask(self):
         """Get current population as candidates"""
-        if not self.is_initialized or not self.algorithm or not self.algorithm.pop:
+        if not self.evaluated_x:
             return []
         
-        X = self.algorithm.pop.get("X")
-        if X is None:
-            return []
-        
-        # Convert to parameter dictionaries
-        candidates = []
-        for i in range(len(X)):
-            x_params = {}
-            for j, name in enumerate(self.pymoo_problem.param_names):
-                if self.pymoo_problem.param_types[j] == 'continuous':
-                    x_params[name] = float(X[i, j])
-                elif self.pymoo_problem.param_types[j] == 'integer':
-                    x_params[name] = int(round(float(X[i, j])))
-                elif self.pymoo_problem.param_types[j] == 'categorical':
-                    cat_idx = int(round(float(X[i, j])))
-                    x_params[name] = self.pymoo_problem.categorical_mappings[j][cat_idx]
-            
-            candidates.append(x_params)
-        
-        return candidates
+        return self.evaluated_x
     
     def tell(self, x, y):
         """Update with evaluated solutions and run the next generation"""
-        # Check if properly initialized before continuing
-        if not self.is_initialized:
-            raise RuntimeError("Algorithm not properly initialized. Call setup() first.")
-            
         # Increment generation counter
         self.current_gen += 1
         
         if self.current_gen >= self.max_gen:
             return
-           
-        # Set current population's F values directly (already evaluated externally)
-        F = -1 * np.array(y)  # Negate for maximization
-        for i in range(len(self.algorithm.pop)):
-            self.algorithm.pop[i].set("F", F[i])
-        
-        # Advance to the next generation without using deepcopy
+            
+        # Run the next generation
         try:
-            # This performs mating and generates offspring
-            self.algorithm.mating.do(self.algorithm.problem, self.algorithm.pop, self.algorithm.n_offsprings, algorithm=self.algorithm)
-            
-            # Store newly evaluated solutions
-            self._update_evaluations()
-            
-            # Create new population for next generation
-            self.algorithm.next()
-            
+            self._run_generation()
         except Exception as e:
             print(f"Error in evolutionary algorithm: {str(e)}")
             import traceback

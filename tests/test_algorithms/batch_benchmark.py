@@ -168,6 +168,29 @@ def generate_comparison_plots(results, output_dir):
         plt.tight_layout()
         plt.savefig(os.path.join(problem_dir, f'pareto_size_comparison.png'))
         plt.close()
+        
+        # Aggregate plot visualizing all evaluation trajectories
+        # This provides a comprehensive view of how algorithms explore the objective space
+        plt.figure(figsize=(12, 8))
+        
+        # Each algorithm will have a unique color for its Pareto front
+        colors = ['r', 'g', 'b', 'c', 'm', 'y', 'k', 'orange', 'purple', 'brown']
+        
+        # For each algorithm on this problem, get the image file
+        for i, result in enumerate(problem_results):
+            algo = result['algorithm']
+            pareto_img_path = os.path.join(problem_dir, algo, f"{algo}_{problem}_pareto.png")
+            
+            if os.path.exists(pareto_img_path):
+                # Create a link to the detailed plot in the problem directory
+                plt.figtext(0.1, 0.95 - i*0.05, f"{algo}: View detailed plot", 
+                           color=colors[i % len(colors)], 
+                           fontweight='bold')
+        
+        plt.title(f"Optimization Trajectories on {problem}")
+        plt.tight_layout()
+        plt.savefig(os.path.join(problem_dir, f'all_trajectories.png'))
+        plt.close()
     
     # Create overall comparison plots
     # Average runtime by algorithm

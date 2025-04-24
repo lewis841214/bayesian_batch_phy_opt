@@ -39,6 +39,18 @@ pip install -r requirements.txt
 
 python tests/test_algorithms/unified_benchmark.py --compare --algorithms qnehvi qehvi qparego nsga2 moead nsga3 --problems nonlinear constrained --budget 20 --batch-size 5 --output-dir output/multi_problem_benchmark
 ```
+
+``` only test one 
+
+python tests/test_algorithms/unified_benchmark.py --compare --algorithms nsga2 moead nsga3 qnehvi qehvi qparego --problem complex_categorical --budget 500 --batch-size 20 --output-dir output/complex_categorical_comparison_all
+
+
+python tests/test_algorithms/unified_benchmark.py --algorithm nsga2 --problem category_matrix --budget 50 --batch-size 10 --output-dir output/category_matrix_nsga2
+```
+
+```# test all problems, all algorithm
+python tests/test_algorithms/batch_benchmark.py --budget 50 --batch-size 10 --output-dir output/full_comparison_50_10
+```
 Here's a simple example of using the q-EHVI algorithm on a multi-objective problem:
 
 ```python

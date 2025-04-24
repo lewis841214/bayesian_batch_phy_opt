@@ -31,6 +31,9 @@ def run_optimization(algorithm_name, problem_name, budget, batch_size, output_di
     start_time = time.time()
     
     remaining_budget = budget
+    all_evaluated_x = []
+    all_evaluated_y = []
+    
     while remaining_budget > 0:
         # Determine batch size for this iteration
         current_batch = min(batch_size, remaining_budget)
@@ -43,11 +46,14 @@ def run_optimization(algorithm_name, problem_name, budget, batch_size, output_di
         for candidate in candidates[:current_batch]:  # Ensure we respect batch size
             value = problem.evaluate(candidate)
             values.append(value)
+            
+            # Store all evaluated points
+            all_evaluated_x.append(candidate)
+            all_evaluated_y.append(value)
         
         # Update algorithm
-        
         adapter.tell(candidates[:current_batch], values)
-        print(type(candidates))
+        
         # Update budget
         remaining_budget -= current_batch
     
@@ -63,12 +69,19 @@ def run_optimization(algorithm_name, problem_name, budget, batch_size, output_di
     # Plot results
     if output_dir and problem.num_objectives in [2, 3]:
         pareto_ys = np.array(pareto_y)
+        all_ys = np.array(all_evaluated_y)
         
         # Create output directory
         os.makedirs(output_dir, exist_ok=True)
         
         if problem.num_objectives == 2:
             plt.figure(figsize=(10, 6))
+            
+            # Plot all evaluated points with lower opacity
+            if len(all_ys) > 0:
+                plt.scatter(all_ys[:, 0], all_ys[:, 1], color='blue', alpha=0.3, label='All evaluated points')
+            
+            # Plot Pareto front with higher opacity
             plt.scatter(pareto_ys[:, 0], pareto_ys[:, 1], color='red', label='Pareto front')
             
             # Sort for line if more than one point
@@ -89,12 +102,18 @@ def run_optimization(algorithm_name, problem_name, budget, batch_size, output_di
             fig = plt.figure(figsize=(10, 8))
             ax = fig.add_subplot(111, projection='3d')
             
-            ax.scatter(pareto_ys[:, 0], pareto_ys[:, 1], pareto_ys[:, 2], c='r', marker='o')
+            # Plot all evaluated points with lower opacity
+            if len(all_ys) > 0:
+                ax.scatter(all_ys[:, 0], all_ys[:, 1], all_ys[:, 2], c='blue', alpha=0.3, label='All evaluated points')
+            
+            # Plot Pareto front with higher opacity
+            ax.scatter(pareto_ys[:, 0], pareto_ys[:, 1], pareto_ys[:, 2], c='r', marker='o', label='Pareto front')
             
             ax.set_xlabel('Objective 1')
             ax.set_ylabel('Objective 2')
             ax.set_zlabel('Objective 3')
             ax.set_title(f'Pareto Front: {algorithm_name} on {problem_name}')
+            ax.legend()
             
             plt.savefig(os.path.join(output_dir, f'{algorithm_name}_{problem_name}_pareto3d.png'))
             plt.close()
@@ -105,7 +124,9 @@ def run_optimization(algorithm_name, problem_name, budget, batch_size, output_di
         'runtime': runtime,
         'hypervolume': hypervolume,
         'pareto_size': len(pareto_x),
-        'pareto_y': pareto_y
+        'pareto_y': pareto_y,
+        'all_evaluated_x': all_evaluated_x,
+        'all_evaluated_y': all_evaluated_y
     }
 
 def compare_algorithms(problem_name, algorithms, budget, batch_size, output_dir=None):
