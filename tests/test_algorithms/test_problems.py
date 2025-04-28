@@ -555,6 +555,9 @@ class ComplexInteractionProblem(TestProblem):
         Objectives:
         - f1: Focuses on higher-order polynomial terms and interactions
         - f2: Focuses on trigonometric transformations and exponential scaling
+        
+        Note: Values are negated to convert from minimization to maximization
+        problem to be consistent with the algorithm implementation.
         """
         # Extract parameters into an array for easier manipulation
         x = np.array([params[f'x{i}'] for i in range(1, 11)])
@@ -575,32 +578,33 @@ class ComplexInteractionProblem(TestProblem):
         # Second-order interaction terms (triplets)
         interactions2 = x[0]*x[3]*x[6] + x[1]*x[4]*x[7] + x[2]*x[5]*x[8]
         
-        # Complex interaction between all parameters
-        all_interactions = 0.1 * np.prod(x)
+        # Complex interaction between all parameters - limit extreme values
+        # Use sum instead of product to avoid extremely large values
+        all_interactions = 0.1 * np.sum(x)
         
-        # Combine into first objective (smaller is better)
-        f1 = quadratic + cubic + quartic + interactions1 + interactions2 + all_interactions
+        # Combine into first objective (NEGATED so LARGER is better for maximization)
+        f1 = -1 * (quadratic + cubic + quartic + interactions1 + interactions2 + all_interactions)
         
         # === Second objective - trigonometric and exponential terms ===
         # Sinusoidal components
         sin_terms = 10 * np.sin(x[0]) * np.cos(x[1]) + 5 * np.sin(x[2] * x[3])
         
-        # Exponential terms
-        exp_terms = np.exp(0.1 * x[4]) + np.exp(0.2 * x[5]) - np.exp(-0.1 * x[6])
+        # Exponential terms - cap to avoid overflow
+        exp_terms = np.minimum(10, np.exp(0.1 * x[4])) + np.minimum(10, np.exp(0.2 * x[5])) - np.minimum(10, np.exp(-0.1 * x[6]))
         
         # Rational terms to create steep landscapes
         rational = x[7] / (1 + x[8]**2) + x[9] / (1 + x[0]**2)
         
         # Mixed interaction with trig functions
-        mixed = np.sin(x[0] * x[1]) * np.cos(x[2] + x[3]) * np.exp(0.1 * x[4])
+        mixed = np.sin(x[0] * x[1]) * np.cos(x[2] + x[3]) * np.minimum(10, np.exp(0.1 * x[4]))
         
         # Distance from a specific point in parameter space
         point_distance = np.sum((x - np.array([1, -1, 2, -2, 1.5, -1.5, 1, -1, 0.5, -0.5]))**2)
         
-        # Combine into second objective (smaller is better)
-        f2 = sin_terms + exp_terms + rational + mixed + point_distance
+        # Combine into second objective (NEGATED so LARGER is better for maximization)
+        f2 = -1 * (sin_terms + exp_terms + rational + mixed + point_distance)
         
-        # Return objectives (already set up for minimization)
+        # Return objectives - now set up for maximization (larger is better)
         return [f1, f2]
     
     @property
@@ -610,8 +614,9 @@ class ComplexInteractionProblem(TestProblem):
     
     def get_reference_point(self) -> List[float]:
         """Return a custom reference point for hypervolume calculation"""
-        # Higher values than default to accommodate the potentially larger objective values
-        return [500.0, 500.0]
+        # Set reference point to minimum possible values,
+        # accounting for the negative objectives in maximization setting
+        return [-500.0, -200.0]
 
 
 # Define available test problems
