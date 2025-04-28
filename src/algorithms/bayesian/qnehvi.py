@@ -260,8 +260,8 @@ class QNEHVI(MultiObjectiveOptimizer):
         # sobol_samples = draw_sobol_samples(bounds=standard_bounds, n=n_samples, q=effective_batch_size).squeeze(0)
         
         # Optimize from multiple random starting points to avoid local optima
-        n_restarts = 3
-        raw_samples = 50
+        n_restarts = 50
+        raw_samples = 100
         
         try:
             candidates, acq_values = optimize_acqf(
@@ -270,7 +270,7 @@ class QNEHVI(MultiObjectiveOptimizer):
                 q=effective_batch_size,
                 num_restarts=n_restarts,
                 raw_samples=raw_samples,
-                options={"batch_limit": 5, "maxiter": 100},
+                options={"batch_limit": 5, "maxiter": 200},
                 sequential=True,
             )
             print(f"Acquisition value: {acq_values.item():.6f}")

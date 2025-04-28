@@ -5,6 +5,9 @@ from src.algorithms.bayesian.qnehvi import QNEHVI
 # from src.algorithms.bayesian.qehvi import QEHVI
 # from src.algorithms.bayesian.qparego import QNParEGO
 
+# Import random search algorithm
+from src.algorithms.random.random_search import RandomSearch
+
 # Import evolutionary algorithm classes from pymoo
 from pymoo.algorithms.moo.nsga2 import NSGA2 as PyMOO_NSGA2
 from pymoo.algorithms.moo.moead import MOEAD as PyMOO_MOEAD
@@ -359,6 +362,44 @@ class EvolutionaryAdapter(AlgorithmAdapter):
         return hv.do(F)
 
 
+class RandomSearchAdapter(AlgorithmAdapter):
+    """Adapter for the random search algorithm"""
+    
+    def __init__(self):
+        """Initialize adapter"""
+        self.algorithm = None
+    
+    def setup(self, problem, budget, batch_size):
+        """Setup random search optimizer"""
+        parameter_space = problem.get_parameter_space()
+        ref_point = problem.get_reference_point()
+        
+        self.algorithm = RandomSearch(
+            parameter_space=parameter_space,
+            budget=budget,
+            batch_size=batch_size,
+            n_objectives=problem.num_objectives,
+            ref_point=ref_point
+        )
+        return self
+    
+    def ask(self):
+        """Get next batch of points to evaluate"""
+        return self.algorithm.ask()
+    
+    def tell(self, x, y):
+        """Update with evaluated solutions"""
+        self.algorithm.tell(x, y)
+    
+    def get_result(self):
+        """Return current result (Pareto front)"""
+        return self.algorithm.recommend()
+    
+    def get_hypervolume(self):
+        """Calculate hypervolume"""
+        return self.algorithm.get_hypervolume()
+
+
 def get_algorithm_adapter(algorithm_name: str) -> AlgorithmAdapter:
     """Get algorithm adapter based on name"""
     algorithm_name = algorithm_name.lower()
@@ -386,5 +427,7 @@ def get_algorithm_adapter(algorithm_name: str) -> AlgorithmAdapter:
     elif algorithm_name == 'xgb-qnehvi':
         from src.adapters.qnehvi_hybrid_adapter import QNEHVIHybridAdapter
         return QNEHVIHybridAdapter(surrogate_model="xgboost")
+    elif algorithm_name == 'randomsearch':
+        return RandomSearchAdapter()
     else:
         raise ValueError(f"Unknown algorithm: {algorithm_name}") 

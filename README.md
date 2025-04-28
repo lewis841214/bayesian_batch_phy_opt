@@ -103,16 +103,25 @@ bayesian_batch_phy_opt/
 │   │   ├── algorithm.py            # Base optimizer class
 │   │   ├── problem.py              # Problem definition
 │   │   ├── metrics.py              # Performance metrics
-│   │   └── visualization.py        # Result visualization
+│   │   └── __init__.py             # Package initialization
 │   ├── algorithms/                 # Algorithm implementations
 │   │   ├── bayesian/               # Bayesian optimization algorithms
 │   │   ├── evolutionary/           # Evolutionary algorithms
 │   │   ├── ant_colony/             # Ant colony optimization
 │   │   └── pabo/                   # Physics-aware Bayesian optimization
-│   ├── adapters/                   # Framework adapters
-│   └── benchmarks/                 # Benchmark problems
+│   └── adapters/                   # Framework adapters
 ├── tests/                          # Test suite
-└── examples/                       # Usage examples
+│   ├── test_core/                  # Tests for core functionality
+│   ├── test_algorithms/            # Tests for optimization algorithms
+│   │   └── test_problems.py        # Benchmark problem definitions
+│   └── test_adapters/              # Tests for framework adapters
+├── examples/                       # Usage examples
+├── output/                         # Output directory for benchmarks
+├── notebook/                       # Jupyter notebooks
+├── setup.py                        # Package installation script
+├── requirements.txt                # Required dependencies
+├── run_examples.py                 # Script to run examples
+└── run_tests.py                    # Script to run tests
 ```
 
 ## Contributing

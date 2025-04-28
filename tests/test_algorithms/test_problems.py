@@ -386,12 +386,12 @@ class ComplexCategoryEmbeddingProblem(TestProblem):
     
     def __init__(self, n_embed=12):
         # Number of parameters and options
-        self.num_params = 4
-        self.num_options = 5
+        self.num_params = 9
+        self.num_options = 3
         self.n_embed = n_embed
         
         # Seed for reproducibility
-        np.random.seed(42)
+        np.random.seed(42) # original: 42
         
         # For each parameter (i), create a matrix of shape [num_options x n_embed]
         # mp[i][j] gives the embedding vector for option j of parameter i
@@ -524,6 +524,96 @@ class ComplexCategoryEmbeddingProblem(TestProblem):
         return 2
 
 
+class ComplexInteractionProblem(TestProblem):
+    """
+    Complex test problem with 10 continuous parameters and highly non-linear interactions.
+    
+    The problem features:
+    - 10 continuous parameters (x1 through x10)
+    - Complex interaction terms between parameters
+    - Higher dimensional terms (cubic, quartic)
+    - Trigonometric and exponential transformations
+    - Multiple local optima
+    
+    This creates a challenging landscape for optimization algorithms.
+    """
+    
+    def get_parameter_space(self) -> ParameterSpace:
+        """Return the parameter space with 10 continuous parameters"""
+        space = ParameterSpace()
+        
+        # Add 10 continuous parameters with reasonable bounds
+        for i in range(1, 11):
+            space.add_continuous_parameter(f'x{i}', -5.0, 5.0)
+            
+        return space
+    
+    def evaluate(self, params: Dict[str, Any]) -> List[float]:
+        """
+        Evaluate the complex objective functions with interaction terms.
+        
+        Objectives:
+        - f1: Focuses on higher-order polynomial terms and interactions
+        - f2: Focuses on trigonometric transformations and exponential scaling
+        """
+        # Extract parameters into an array for easier manipulation
+        x = np.array([params[f'x{i}'] for i in range(1, 11)])
+        
+        # === First objective - polynomial interactions ===
+        # Quadratic terms
+        quadratic = np.sum(x**2)
+        
+        # Cubic terms for some parameters
+        cubic = x[0]**3 - x[2]**3 + x[5]**3
+        
+        # Quartic terms for other parameters
+        quartic = x[1]**4 + x[3]**4 + 0.5 * x[8]**4
+        
+        # First-order interaction terms (pairwise)
+        interactions1 = x[0]*x[1] + x[1]*x[2] + x[2]*x[3] + x[3]*x[4] + x[4]*x[5]
+        
+        # Second-order interaction terms (triplets)
+        interactions2 = x[0]*x[3]*x[6] + x[1]*x[4]*x[7] + x[2]*x[5]*x[8]
+        
+        # Complex interaction between all parameters
+        all_interactions = 0.1 * np.prod(x)
+        
+        # Combine into first objective (smaller is better)
+        f1 = quadratic + cubic + quartic + interactions1 + interactions2 + all_interactions
+        
+        # === Second objective - trigonometric and exponential terms ===
+        # Sinusoidal components
+        sin_terms = 10 * np.sin(x[0]) * np.cos(x[1]) + 5 * np.sin(x[2] * x[3])
+        
+        # Exponential terms
+        exp_terms = np.exp(0.1 * x[4]) + np.exp(0.2 * x[5]) - np.exp(-0.1 * x[6])
+        
+        # Rational terms to create steep landscapes
+        rational = x[7] / (1 + x[8]**2) + x[9] / (1 + x[0]**2)
+        
+        # Mixed interaction with trig functions
+        mixed = np.sin(x[0] * x[1]) * np.cos(x[2] + x[3]) * np.exp(0.1 * x[4])
+        
+        # Distance from a specific point in parameter space
+        point_distance = np.sum((x - np.array([1, -1, 2, -2, 1.5, -1.5, 1, -1, 0.5, -0.5]))**2)
+        
+        # Combine into second objective (smaller is better)
+        f2 = sin_terms + exp_terms + rational + mixed + point_distance
+        
+        # Return objectives (already set up for minimization)
+        return [f1, f2]
+    
+    @property
+    def num_objectives(self) -> int:
+        """Return the number of objectives"""
+        return 2
+    
+    def get_reference_point(self) -> List[float]:
+        """Return a custom reference point for hypervolume calculation"""
+        # Higher values than default to accommodate the potentially larger objective values
+        return [500.0, 500.0]
+
+
 # Define available test problems
 TEST_PROBLEMS = {
     'mixed': MixedParameterTestProblem(),
@@ -532,7 +622,8 @@ TEST_PROBLEMS = {
     'constrained': ConstrainedTestProblem(),
     'large_mixed': LargeMixedParameterTestProblem(),
     'category_matrix': CategoryMatrixTestProblem(),
-    'complex_categorical': ComplexCategoryEmbeddingProblem()
+    'complex_categorical': ComplexCategoryEmbeddingProblem(),
+    'complex_interaction': ComplexInteractionProblem()
 }
 
 
