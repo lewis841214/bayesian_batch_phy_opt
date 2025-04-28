@@ -64,6 +64,13 @@ class QNEHVI(MultiObjectiveOptimizer):
         self.mc_samples = mc_samples
         self.ref_point = ref_point
         self.noise_std = noise_std
+        
+        # Track model training metrics
+        self.model_metrics = {
+            'train_losses': [],
+            'val_losses': []
+        }
+        
         super().__init__(parameter_space, budget, batch_size, n_objectives)
         
         # Track timings for progress estimation
@@ -112,7 +119,8 @@ class QNEHVI(MultiObjectiveOptimizer):
         
         for i in tqdm(range(self.n_objectives), desc="Fitting GP models"):
             y = Y[:, i:i+1]  # Get ith objective, keep dimension
-            model = SingleTaskGP(X, y, outcome_transform=None)
+            # Create GP model with standardized outputs
+            model = SingleTaskGP(X, y, outcome_transform=Standardize(m=1))
             mll = ExactMarginalLogLikelihood(model.likelihood, model)
             fit_gpytorch_mll(mll)
             models.append(model)
@@ -125,6 +133,10 @@ class QNEHVI(MultiObjectiveOptimizer):
         print(f"Model fitting completed in {elapsed:.2f} seconds")
         
         return model_list
+    
+    def get_model_metrics(self):
+        """Return neural network training metrics"""
+        return self.model_metrics
     
     def ask(self):
         """Return a batch of points to evaluate"""
@@ -219,15 +231,33 @@ class QNEHVI(MultiObjectiveOptimizer):
             # Ensure alpha is a valid value (default to 1e-3 if None)
             alpha = 1e-3 if self.noise_std is None else self.noise_std
             
-            # Create the acquisition function with the sampler
-            acq_func = qNoisyExpectedHypervolumeImprovement(
-                model=model_list,
-                ref_point=self.ref_point.clone().detach(),  # Proper tensor cloning
-                X_baseline=X_baseline,
-                prune_baseline=True,
-                alpha=alpha,
-                sampler=sampler,  # Use the created sampler
-            )
+            # Debug print data types
+            print(f"DEBUG - ref_point dtype: {self.ref_point.dtype}, X_baseline dtype: {X_baseline.dtype}")
+            
+            # Create the acquisition function with the sampler - use qLogNoisyExpectedHypervolumeImprovement instead
+            try:
+                # Try to use the improved LogNEHVI implementation if available
+                from botorch.acquisition.multi_objective.monte_carlo import qLogNoisyExpectedHypervolumeImprovement
+                acq_func = qLogNoisyExpectedHypervolumeImprovement(
+                    model=model_list,
+                    ref_point=self.ref_point.clone().detach(),
+                    X_baseline=X_baseline,
+                    prune_baseline=True,
+                    alpha=alpha,
+                    sampler=sampler
+                )
+                print("Using qLogNoisyExpectedHypervolumeImprovement")
+            except ImportError:
+                # Fall back to original NEHVI if the Log version isn't available
+                acq_func = qNoisyExpectedHypervolumeImprovement(
+                    model=model_list,
+                    ref_point=self.ref_point.clone().detach(),
+                    X_baseline=X_baseline,
+                    prune_baseline=True,
+                    alpha=alpha,
+                    sampler=sampler
+                )
+                print("Using qNoisyExpectedHypervolumeImprovement")
         except Exception as e:
             print(f"Error creating acquisition function: {e}")
             # Fall back to random sampling
@@ -250,30 +280,36 @@ class QNEHVI(MultiObjectiveOptimizer):
         # Optimize acquisition function
         print(f"Optimizing acquisition function to find {effective_batch_size} candidates...")
         
-        # Initialize with Sobol samples
-        # n_samples = 1000
-        
         # Use standard bounds [0, 1] for optimization
         standard_bounds = torch.zeros(2, X_baseline.shape[1], dtype=torch.double)
         standard_bounds[1] = 1.0
         
-        # sobol_samples = draw_sobol_samples(bounds=standard_bounds, n=n_samples, q=effective_batch_size).squeeze(0)
-        
-        # Optimize from multiple random starting points to avoid local optima
-        n_restarts = 50
-        raw_samples = 100
+        # Reduce number of restarts and raw samples for faster optimization
+        n_restarts = 1
+        raw_samples = 50
         
         try:
+            # Debug print for optimization settings
+            print(f"DEBUG - Optimization settings: batch_size={effective_batch_size}, num_restarts={n_restarts}, raw_samples={raw_samples}")
+            
+            # Try with sequential=True first for better numerical stability
             candidates, acq_values = optimize_acqf(
                 acq_function=acq_func,
                 bounds=standard_bounds,
                 q=effective_batch_size,
                 num_restarts=n_restarts,
                 raw_samples=raw_samples,
-                options={"batch_limit": 5, "maxiter": 200},
+                options={"batch_limit": 5, "maxiter": 100, "ftol": 1e-5, "method": "L-BFGS-B"},
                 sequential=True,
             )
-            print(f"Acquisition value: {acq_values.item():.6f}")
+            
+            if acq_values.numel() > 1:  # If we get multiple values
+                print(f"Acquisition values shape: {acq_values.shape}, taking mean")
+                acq_value_scalar = acq_values.mean().item()
+            else:
+                acq_value_scalar = acq_values.item()
+                
+            print(f"Acquisition value: {acq_value_scalar:.6f}")
             
             # Unnormalize candidates
             candidates = unnormalize(candidates.detach(), bounds_t)
