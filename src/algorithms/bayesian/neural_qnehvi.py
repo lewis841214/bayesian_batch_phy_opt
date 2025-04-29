@@ -336,7 +336,7 @@ class NNQNEHVI(QNEHVI):
                     best_model_state = model.state_dict().copy()
             
             # Print progress every 10 epochs
-            if (epoch + 1) % 1000 == 0 or epoch == 0:
+            if (epoch + 1) % 100 == 0 or epoch == 0:
                 print(f"Epoch {epoch+1}/{self.nn_epochs}, Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}")
         
         # Load best model
@@ -352,7 +352,7 @@ class NNQNEHVI(QNEHVI):
             self.model_metrics['val_losses'][objective_idx] = val_losses
             
         print(f"Neural network training completed. Final val loss: {best_val_loss:.6f}")
-        
+        breakpoint()
         return model
         
     def _update_model(self, output_dir=None):
@@ -389,9 +389,9 @@ class NNQNEHVI(QNEHVI):
                 train_X=X,
                 train_Y=y,  # Pass 1D tensor as BoTorch expects
                 nn_model=nn_model,
-                outcome_transform=Standardize(m=1)
+                # outcome_transform=Standardize(m=1)
             )
-            
+            # breakpoint()
             # Fit GP parameters (keeping neural network fixed)
             mll = ExactMarginalLogLikelihood(model.likelihood, model)
             
@@ -653,6 +653,7 @@ class NNQNEHVI(QNEHVI):
         Plot and save true vs predicted values for each objective using random test points.
         Evaluates model generalization by testing on unseen points from the domain.
         Plots both training data (seen) and test data (unseen) with different colors.
+        Also compares neural network predictions vs GP predictions with NN as mean function.
         
         Args:
             output_dir: Directory to save plots
@@ -665,9 +666,13 @@ class NNQNEHVI(QNEHVI):
         
         os.makedirs(output_dir, exist_ok=True)
         
-        # Make sure we have a model
+        # Make sure we have a model and nn_models
         if not hasattr(self, 'model') or self.model is None:
-            print("Warning: Models not available for plotting predictions")
+            print("Warning: GP models not available for plotting predictions")
+            return
+            
+        if not hasattr(self, 'nn_models') or len(self.nn_models) == 0:
+            print("Warning: Neural network models not available for plotting predictions")
             return
         
         # Generate test points by sampling from the parameter space
@@ -926,6 +931,7 @@ class NNQNEHVI(QNEHVI):
                 if problem_name == "unknown":
                     raise ValueError("No matching test problem found for parameter space")
                     
+                problem_name = 'nonlinear'
                 print(f"Using test problem '{problem_name}' for evaluating prediction accuracy")
                 print(f"Our parameters: {len(best_param_match['our_params'])}, Test problem parameters: {len(best_param_match['problem_params'])}")
                 test_problem = get_test_problem(problem_name)
@@ -974,68 +980,211 @@ class NNQNEHVI(QNEHVI):
                 print("Falling back to random values for true evaluations")
                 true_np = np.random.rand(n_test_points, self.n_objectives) * 10
         
-        # Get predictions for the test points
+        # Normalize inputs for both NN and GP prediction
+        X_norm_test = normalize(X_test_tensor, self.bounds.transpose(0, 1))
+        
+        # Get GP predictions for the test points
         with torch.no_grad():
-            X_norm_test = normalize(X_test_tensor, self.bounds.transpose(0, 1))
-            predictions_test = self.model.posterior(X_norm_test).mean
+            gp_predictions_test = self.model.posterior(X_norm_test).mean
             
+        # Get NN-only predictions for test points
+        nn_predictions_test = []
+        for i, nn_model in enumerate(self.nn_models):
+            with torch.no_grad():
+                # Use the neural network directly for predictions
+                nn_pred = nn_model(X_norm_test)
+                # Make sure output is the right shape
+                if nn_pred.dim() > 1 and nn_pred.shape[1] == 1:
+                    nn_pred = nn_pred.squeeze(-1)
+                nn_predictions_test.append(nn_pred)
+        
+        # Stack neural network predictions along a new dimension
+        nn_pred_tensor = torch.stack(nn_predictions_test, dim=1)
+        
         # Convert predictions to numpy for easier handling
-        pred_test_np = predictions_test.cpu().numpy()
+        gp_pred_test_np = gp_predictions_test.cpu().numpy()
+        nn_pred_test_np = nn_pred_tensor.cpu().numpy()
         
         # Get predictions for the training points
         with torch.no_grad():
             X_norm_train = normalize(self.train_x, self.bounds.transpose(0, 1))
-            predictions_train = self.model.posterior(X_norm_train).mean
+            gp_predictions_train = self.model.posterior(X_norm_train).mean
+            
+            # Get NN-only predictions for training points
+            nn_predictions_train = []
+            for i, nn_model in enumerate(self.nn_models):
+                # Use the neural network directly for predictions
+                nn_pred = nn_model(X_norm_train)
+                # Make sure output is the right shape
+                if nn_pred.dim() > 1 and nn_pred.shape[1] == 1:
+                    nn_pred = nn_pred.squeeze(-1)
+                nn_predictions_train.append(nn_pred)
+                
+            # Stack neural network predictions along a new dimension
+            nn_pred_train_tensor = torch.stack(nn_predictions_train, dim=1)
         
         # Convert predictions and true values to numpy
-        pred_train_np = predictions_train.cpu().numpy()
+        gp_pred_train_np = gp_predictions_train.cpu().numpy()
+        nn_pred_train_np = nn_pred_train_tensor.cpu().numpy()
         true_train_np = self.train_y.cpu().numpy()
         
         # Plot for each objective
         for i in range(self.n_objectives):
-            plt.figure(figsize=(12, 8))
+            # Create figure with larger size for combined plot
+            plt.figure(figsize=(16, 12))
             
-            # Plot training data (seen)
-            plt.scatter(true_train_np[:, i], pred_train_np[:, i], alpha=0.7, color='blue', 
-                       label=f'Training data (n={len(true_train_np)})', marker='o')
+            # Subplot for GP predictions
+            plt.subplot(2, 2, 1)
+            plt.title(f'GP Predictions - Training Data (Objective {i+1})')
+            plt.scatter(true_train_np[:, i], gp_pred_train_np[:, i], alpha=0.7, color='blue', 
+                       marker='o')
             
-            # Plot test data (unseen)
-            plt.scatter(true_np[:, i], pred_test_np[:, i], alpha=0.5, color='red', 
-                       label=f'Test data (n={len(true_np)})', marker='x')
+            # Find min and max for diagonal line
+            min_val = min(np.min(true_train_np[:, i]), np.min(gp_pred_train_np[:, i]))
+            max_val = max(np.max(true_train_np[:, i]), np.max(gp_pred_train_np[:, i]))
+            plt.plot([min_val, max_val], [min_val, max_val], 'k--')
+            plt.xlabel('True values')
+            plt.ylabel('GP predicted values')
             
-            # Find global min and max for perfect prediction line
-            all_true = np.concatenate([true_train_np[:, i], true_np[:, i]])
-            all_pred = np.concatenate([pred_train_np[:, i], pred_test_np[:, i]])
-            min_val = min(np.min(all_true), np.min(all_pred))
-            max_val = max(np.max(all_true), np.max(all_pred))
+            # Calculate error metrics
+            gp_train_mse = np.mean((true_train_np[:, i] - gp_pred_train_np[:, i])**2)
+            gp_train_mae = np.mean(np.abs(true_train_np[:, i] - gp_pred_train_np[:, i]))
+            plt.text(0.05, 0.95, f'MSE: {gp_train_mse:.4f}\nMAE: {gp_train_mae:.4f}', 
+                    transform=plt.gca().transAxes, fontsize=9,
+                    bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.7))
             
-            # Plot perfect prediction line
-            plt.plot([min_val, max_val], [min_val, max_val], 'k--', label='Perfect prediction')
+            # Subplot for NN predictions
+            plt.subplot(2, 2, 2)
+            plt.title(f'NN Predictions - Training Data (Objective {i+1})')
+            plt.scatter(true_train_np[:, i], nn_pred_train_np[:, i], alpha=0.7, color='green', 
+                       marker='o')
             
-            # Calculate error statistics for test data
-            test_mse = np.mean((true_np[:, i] - pred_test_np[:, i])**2)
-            test_mae = np.mean(np.abs(true_np[:, i] - pred_test_np[:, i]))
+            # Find min and max for diagonal line
+            min_val = min(np.min(true_train_np[:, i]), np.min(nn_pred_train_np[:, i]))
+            max_val = max(np.max(true_train_np[:, i]), np.max(nn_pred_train_np[:, i]))
+            plt.plot([min_val, max_val], [min_val, max_val], 'k--')
+            plt.xlabel('True values')
+            plt.ylabel('NN predicted values')
             
-            # Calculate error statistics for training data
-            train_mse = np.mean((true_train_np[:, i] - pred_train_np[:, i])**2)
-            train_mae = np.mean(np.abs(true_train_np[:, i] - pred_train_np[:, i]))
+            # Calculate error metrics
+            nn_train_mse = np.mean((true_train_np[:, i] - nn_pred_train_np[:, i])**2)
+            nn_train_mae = np.mean(np.abs(true_train_np[:, i] - nn_pred_train_np[:, i]))
+            plt.text(0.05, 0.95, f'MSE: {nn_train_mse:.4f}\nMAE: {nn_train_mae:.4f}', 
+                    transform=plt.gca().transAxes, fontsize=9,
+                    bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.7))
+            
+            # Subplot for GP test predictions
+            plt.subplot(2, 2, 3)
+            plt.title(f'GP Predictions - Test Data (Objective {i+1})')
+            plt.scatter(true_np[:, i], gp_pred_test_np[:, i], alpha=0.7, color='red', 
+                       marker='x')
+            
+            # Find min and max for diagonal line
+            min_val = min(np.min(true_np[:, i]), np.min(gp_pred_test_np[:, i]))
+            max_val = max(np.max(true_np[:, i]), np.max(gp_pred_test_np[:, i]))
+            plt.plot([min_val, max_val], [min_val, max_val], 'k--')
+            plt.xlabel('True values')
+            plt.ylabel('GP predicted values')
+            
+            # Calculate error metrics
+            gp_test_mse = np.mean((true_np[:, i] - gp_pred_test_np[:, i])**2)
+            gp_test_mae = np.mean(np.abs(true_np[:, i] - gp_pred_test_np[:, i]))
+            plt.text(0.05, 0.95, f'MSE: {gp_test_mse:.4f}\nMAE: {gp_test_mae:.4f}', 
+                    transform=plt.gca().transAxes, fontsize=9,
+                    bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.7))
+            
+            # Subplot for NN test predictions
+            plt.subplot(2, 2, 4)
+            plt.title(f'NN Predictions - Test Data (Objective {i+1})')
+            plt.scatter(true_np[:, i], nn_pred_test_np[:, i], alpha=0.7, color='orange', 
+                       marker='x')
+            
+            # Find min and max for diagonal line
+            min_val = min(np.min(true_np[:, i]), np.min(nn_pred_test_np[:, i]))
+            max_val = max(np.max(true_np[:, i]), np.max(nn_pred_test_np[:, i]))
+            plt.plot([min_val, max_val], [min_val, max_val], 'k--')
+            plt.xlabel('True values')
+            plt.ylabel('NN predicted values')
+            
+            # Calculate error metrics
+            nn_test_mse = np.mean((true_np[:, i] - nn_pred_test_np[:, i])**2)
+            nn_test_mae = np.mean(np.abs(true_np[:, i] - nn_pred_test_np[:, i]))
+            plt.text(0.05, 0.95, f'MSE: {nn_test_mse:.4f}\nMAE: {nn_test_mae:.4f}', 
+                    transform=plt.gca().transAxes, fontsize=9,
+                    bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.7))
+            
+            # Add overall title
+            plt.suptitle(f'GP vs. NN Predictions - Objective {i+1}\n' +
+                        f'Training: GP MSE={gp_train_mse:.4f}, NN MSE={nn_train_mse:.4f}\n' +
+                        f'Test: GP MSE={gp_test_mse:.4f}, NN MSE={nn_test_mse:.4f}', 
+                        fontsize=14)
+            
+            plt.tight_layout()
+            plt.subplots_adjust(top=0.88)  # Make room for suptitle
+            
+            # Save the combined plot
+            plt.savefig(os.path.join(output_dir, f'gp_vs_nn_obj_{i+1}_iter_{iter_num}.png'), dpi=150)
+            plt.close()
+            
+            # Also create a combined plot - both models on same axes for direct comparison
+            plt.figure(figsize=(15, 10))
+            
+            # Training data
+            plt.subplot(1, 2, 1)
+            plt.title(f'Training Data - Objective {i+1}')
+            plt.scatter(true_train_np[:, i], gp_pred_train_np[:, i], alpha=0.7, color='blue', 
+                       marker='o', label='GP predictions')
+            plt.scatter(true_train_np[:, i], nn_pred_train_np[:, i], alpha=0.7, color='green', 
+                       marker='^', label='NN predictions')
+            
+            # Find global min and max for diagonal line
+            global_min = min(np.min(true_train_np[:, i]), np.min(gp_pred_train_np[:, i]), np.min(nn_pred_train_np[:, i]))
+            global_max = max(np.max(true_train_np[:, i]), np.max(gp_pred_train_np[:, i]), np.max(nn_pred_train_np[:, i]))
+            plt.plot([global_min, global_max], [global_min, global_max], 'k--', label='Perfect prediction')
             
             plt.xlabel('True values')
             plt.ylabel('Predicted values')
-            plt.title(f'True vs Predicted - Objective {i+1}\n' +
-                     f'Train MSE: {train_mse:.4f}, MAE: {train_mae:.4f}\n' +
-                     f'Test MSE: {test_mse:.4f}, MAE: {test_mae:.4f}')
             plt.legend()
-            plt.grid(True)
             
-            # Add error statistics as text
-            stats_text = (f"Training errors: MSE={train_mse:.4f}, MAE={train_mae:.4f}\n"
-                         f"Test errors: MSE={test_mse:.4f}, MAE={test_mae:.4f}")
-            plt.annotate(stats_text, xy=(0.02, 0.95), xycoords='axes fraction', 
-                        fontsize=10, bbox=dict(boxstyle="round,pad=0.5", facecolor='white', alpha=0.7))
+            # Error metrics text
+            plt.text(0.05, 0.95, 
+                    f'GP - MSE: {gp_train_mse:.4f}, MAE: {gp_train_mae:.4f}\n' +
+                    f'NN - MSE: {nn_train_mse:.4f}, MAE: {nn_train_mae:.4f}', 
+                    transform=plt.gca().transAxes, fontsize=10,
+                    bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.7))
             
-            # Save plot
-            plt.savefig(os.path.join(output_dir, f'true_vs_pred_obj_{i+1}_iter_{iter_num}.png'), dpi=150)
+            # Test data
+            plt.subplot(1, 2, 2)
+            plt.title(f'Test Data - Objective {i+1}')
+            plt.scatter(true_np[:, i], gp_pred_test_np[:, i], alpha=0.7, color='red', 
+                       marker='x', label='GP predictions')
+            plt.scatter(true_np[:, i], nn_pred_test_np[:, i], alpha=0.7, color='orange', 
+                       marker='+', label='NN predictions')
+            
+            # Find global min and max for diagonal line
+            global_min = min(np.min(true_np[:, i]), np.min(gp_pred_test_np[:, i]), np.min(nn_pred_test_np[:, i]))
+            global_max = max(np.max(true_np[:, i]), np.max(gp_pred_test_np[:, i]), np.max(nn_pred_test_np[:, i]))
+            plt.plot([global_min, global_max], [global_min, global_max], 'k--', label='Perfect prediction')
+            
+            plt.xlabel('True values')
+            plt.ylabel('Predicted values')
+            plt.legend()
+            
+            # Error metrics text
+            plt.text(0.05, 0.95, 
+                    f'GP - MSE: {gp_test_mse:.4f}, MAE: {gp_test_mae:.4f}\n' +
+                    f'NN - MSE: {nn_test_mse:.4f}, MAE: {nn_test_mae:.4f}', 
+                    transform=plt.gca().transAxes, fontsize=10,
+                    bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.7))
+            
+            # Add overall title
+            plt.suptitle(f'GP vs. NN Predictions Comparison - Objective {i+1}', fontsize=14)
+            
+            plt.tight_layout()
+            plt.subplots_adjust(top=0.90)  # Make room for suptitle
+            
+            # Save the overlay comparison plot
+            plt.savefig(os.path.join(output_dir, f'comparison_obj_{i+1}_iter_{iter_num}.png'), dpi=150)
             plt.close()
 
     def plot_and_save_model_error(self, output_dir: str):

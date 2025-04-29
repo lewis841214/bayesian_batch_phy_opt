@@ -21,7 +21,7 @@ class QNEHVIHybridAdapter(BayesianOptAdapter):
         """
         self.surrogate_model = surrogate_model
         self.nn_config = nn_config or {
-            'hidden_layers': [10], # [10, 10], two hidden layers, each with 10 neurons
+            'hidden_layers': [10, 8], # [10, 10], two hidden layers, each with 10 neurons
             'learning_rate': 0.1,
             'epochs': 3000,
             'batch_size': 100,
