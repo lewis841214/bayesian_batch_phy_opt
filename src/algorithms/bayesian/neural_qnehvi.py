@@ -352,7 +352,7 @@ class NNQNEHVI(QNEHVI):
             self.model_metrics['val_losses'][objective_idx] = val_losses
             
         print(f"Neural network training completed. Final val loss: {best_val_loss:.6f}")
-        breakpoint()
+        # breakpoint()
         return model
         
     def _update_model(self, output_dir=None):
@@ -898,6 +898,12 @@ class NNQNEHVI(QNEHVI):
         # Stack tensors
         X_test_tensor = torch.stack(test_tensors)
         
+
+
+        #####
+        known_problem = None
+        known_problem = 'complex_categorical'
+        
         # Get true values by evaluating the test problem or generating random data
         if use_random_values:
             print("Using random values for true evaluations")
@@ -918,6 +924,15 @@ class NNQNEHVI(QNEHVI):
                     our_param_names = set(self.parameter_space.parameters.keys())
                     problem_param_names = set(problem_space.parameters.keys())
                     
+                    if known_problem:
+                        if name == known_problem:
+                            problem_name = name
+                            best_param_match = {
+                                'our_params': our_param_names,
+                                'problem_params': problem_param_names
+                            }
+                            break
+
                     # Check if our parameters are a subset of the test problem's parameters
                     if our_param_names.issubset(problem_param_names):
                         matches = len(our_param_names)
@@ -931,9 +946,9 @@ class NNQNEHVI(QNEHVI):
                 if problem_name == "unknown":
                     raise ValueError("No matching test problem found for parameter space")
                     
-                problem_name = 'nonlinear'
                 print(f"Using test problem '{problem_name}' for evaluating prediction accuracy")
                 print(f"Our parameters: {len(best_param_match['our_params'])}, Test problem parameters: {len(best_param_match['problem_params'])}")
+
                 test_problem = get_test_problem(problem_name)
                 
                 # Evaluate test points using the test problem
