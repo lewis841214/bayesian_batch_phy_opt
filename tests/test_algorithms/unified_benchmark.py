@@ -47,7 +47,29 @@ def run_optimization(algorithm_name, problem_name, budget, batch_size, output_di
         
         # Get candidates
         tqdm.write(f"\nIteration {iteration+1}: Requesting {current_batch} candidates...")
-        candidates = adapter.ask()
+        
+        # Only pass output_dir to ask() for specific Bayesian optimization algorithms that support it
+        # List of Bayesian optimization algorithms that use surrogate models and support output_dir
+        supported_models = ['qnehvi', 'nn-qnehvi']
+        
+        try:
+            if output_dir and algorithm_name.lower() in supported_models:
+                # Create a specific directory for this run
+                model_plots_dir = os.path.join(output_dir, f"model_plots_{algorithm_name}")
+                os.makedirs(model_plots_dir, exist_ok=True)
+                # Try to get candidates with model prediction plots
+                candidates = adapter.ask(output_dir=model_plots_dir)
+            else:
+                # Get candidates without model prediction plots
+                candidates = adapter.ask()
+        except TypeError as e:
+            # If the adapter doesn't support output_dir, fallback to standard ask
+            if "unexpected keyword argument 'output_dir'" in str(e):
+                tqdm.write(f"Warning: {algorithm_name} adapter doesn't support output_dir parameter")
+                candidates = adapter.ask()
+            else:
+                # Re-raise if it's a different TypeError
+                raise
         
         # Evaluate candidates
         values = []

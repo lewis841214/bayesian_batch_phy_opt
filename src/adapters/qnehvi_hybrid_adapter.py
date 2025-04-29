@@ -21,11 +21,11 @@ class QNEHVIHybridAdapter(BayesianOptAdapter):
         """
         self.surrogate_model = surrogate_model
         self.nn_config = nn_config or {
-            'hidden_layers': [64, 32],
-            'learning_rate': 0.01,
-            'epochs': 300,
-            'batch_size': 16,
-            'regularization': 1e-4
+            'hidden_layers': [10], # [10, 10], two hidden layers, each with 10 neurons
+            'learning_rate': 0.1,
+            'epochs': 3000,
+            'batch_size': 100,
+            'regularization': 1e-5
         }
         
         # Initialize with NNQNEHVI algorithm class
@@ -64,6 +64,12 @@ class QNEHVIHybridAdapter(BayesianOptAdapter):
         )
         
         return self
+    
+    def ask(self, output_dir=None):
+        """Get next batch of candidates with support for model prediction plots"""
+        if output_dir is not None:
+            return self.algorithm.ask(output_dir=output_dir)
+        return self.algorithm.ask()
     
     def get_model_metrics(self):
         """Return neural network training metrics"""

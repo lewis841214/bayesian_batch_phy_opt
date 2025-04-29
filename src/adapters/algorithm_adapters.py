@@ -61,8 +61,10 @@ class BayesianOptAdapter(AlgorithmAdapter):
         )
         return self
     
-    def ask(self):
+    def ask(self, output_dir=None):
         """Get next batch of candidates"""
+        if output_dir is not None and hasattr(self.algorithm, "ask") and "output_dir" in self.algorithm.ask.__code__.co_varnames:
+            return self.algorithm.ask(output_dir=output_dir)
         return self.algorithm.ask()
     
     def tell(self, x, y):
