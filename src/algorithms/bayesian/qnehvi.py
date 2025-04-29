@@ -741,42 +741,46 @@ class QNEHVI(MultiObjectiveOptimizer):
                 
                 # Evaluate test points using the test problem
                 true_values = []
-                try:
-                    # Get all parameters required by the test problem
-                    problem_params = set(problem_space.parameters.keys())
-                    our_params = set(self.parameter_space.parameters.keys())
-                    
-                    # Handle missing parameters
-                    missing_params = problem_params - our_params
-                    if missing_params:
-                        print(f"Missing parameters that will be filled with defaults: {missing_params}")
-                    
-                    for test_dict in test_dicts:
-                        # Create a complete parameter dict by adding default values for missing parameters
-                        complete_test_dict = test_dict.copy()
-                        for param in missing_params:
-                            param_config = problem_space.parameters[param]
-                            if param_config['type'] == 'continuous':
-                                # Use the middle of the range as default
-                                complete_test_dict[param] = (param_config['bounds'][0] + param_config['bounds'][1]) / 2
-                            elif param_config['type'] == 'integer':
-                                # Use the middle of the range as default
-                                complete_test_dict[param] = int((param_config['bounds'][0] + param_config['bounds'][1]) // 2)
-                            elif param_config['type'] == 'categorical':
-                                # Use the first category as default
-                                if 'categories' in param_config:
-                                    complete_test_dict[param] = param_config['categories'][0]
-                                else:
-                                    complete_test_dict[param] = param_config['values'][0]
-                                    
-                        # Evaluate with the complete parameter set
-                        true_values.append(test_problem.evaluate(complete_test_dict))
-                    
-                    true_np = np.array(true_values)
-                except Exception as e:
-                    print(f"Error evaluating test points: {e}")
-                    print("Falling back to random values for true evaluations")
-                    true_np = np.random.rand(n_test_points, self.n_objectives) * 10
+                # Get all parameters required by the test problem
+                problem_params = set(problem_space.parameters.keys())
+                our_params = set(self.parameter_space.parameters.keys())
+                
+                # Handle missing parameters
+                missing_params = problem_params - our_params
+                if missing_params:
+                    print(f"Missing parameters that will be filled with defaults: {missing_params}")
+                
+                for test_dict in test_dicts:
+                    # Create a complete parameter dict by adding default values for missing parameters
+                    complete_test_dict = test_dict.copy()
+                    for param in missing_params:
+                        param_config = problem_space.parameters[param]
+                        if param_config['type'] == 'continuous':
+                            # Use the middle of the range as default
+                            complete_test_dict[param] = (param_config['bounds'][0] + param_config['bounds'][1]) / 2
+                        elif param_config['type'] == 'integer':
+                            # Use the middle of the range as default
+                            complete_test_dict[param] = int((param_config['bounds'][0] + param_config['bounds'][1]) // 2)
+                        elif param_config['type'] == 'categorical':
+                            # Use the first category as default
+                            if 'categories' in param_config:
+                                complete_test_dict[param] = param_config['categories'][0]
+                            else:
+                                complete_test_dict[param] = param_config['values'][0]
+                                
+                    # Evaluate with the complete parameter set
+
+                    test_result = test_problem.evaluate(complete_test_dict)
+                    if type(test_result) == tuple:
+                        true_values.append(test_result[0])
+                    else:
+                        true_values.append(test_result)
+                
+                true_np = np.array(true_values)
+                # except Exception as e:
+                #     print(f"Error evaluating test points: {e}")
+                #     print("Falling back to random values for true evaluations")
+                #     true_np = np.random.rand(n_test_points, self.n_objectives) * 10
                     
             except Exception as e:
                 print(f"Could not use test problem for evaluation: {e}")

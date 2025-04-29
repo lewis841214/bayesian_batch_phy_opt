@@ -21,17 +21,17 @@ class QNEHVIHybridAdapter(BayesianOptAdapter):
         """
         self.surrogate_model = surrogate_model
         self.nn_config = nn_config or {
-            'hidden_layers': [100, 50, 20], # [10, 10], two hidden layers, each with 10 neurons
-            'learning_rate': 0.1,
+            'hidden_layers': [100, 100, 20], # [10, 10], two hidden layers, each with 10 neurons
+            'learning_rate': 0.01,
             'epochs': 3000,
             'batch_size': 100,
-            'regularization': 1e-5
+            'regularization': 1e-4
         }
         
         # Initialize with NNQNEHVI algorithm class
         super().__init__(NNQNEHVI)
     
-    def setup(self, problem, budget, batch_size):
+    def setup(self, problem, budget, batch_size, hidden_map_dim=None):
         """
         Setup Neural Network enhanced Bayesian optimizer
         
@@ -55,12 +55,14 @@ class QNEHVIHybridAdapter(BayesianOptAdapter):
             ref_point=ref_point,
             mc_samples=128,
             
+
             # Neural network specific parameters
             nn_layers=self.nn_config['hidden_layers'],
             nn_learning_rate=self.nn_config['learning_rate'],
             nn_epochs=self.nn_config['epochs'],
             nn_batch_size=self.nn_config['batch_size'],
             nn_regularization=self.nn_config['regularization'],
+            hidden_map_dim=hidden_map_dim,
         )
         
         return self

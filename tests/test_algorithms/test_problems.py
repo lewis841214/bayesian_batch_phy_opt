@@ -389,7 +389,7 @@ class ComplexCategoryEmbeddingProblem(TestProblem):
         self.num_params = 9
         self.num_options = 3
         self.n_embed = n_embed
-        
+        self.hidden_map_dim = [8, 12]
         # Seed for reproducibility
         np.random.seed(42) # original: 42
         
@@ -484,23 +484,26 @@ class ComplexCategoryEmbeddingProblem(TestProblem):
         hidden2 = np.dot(self.W2, hidden1)
         # Apply Tanh activation
         hidden2 = np.tanh(hidden2)
+        half_embed = self.n_embed // 2
+
         
         # Final layer - produce 2 objective values
         # For each objective, apply a different transformation
         objectives = np.zeros(2)
-        
+        objectives[0] = np.sum(hidden2[:, :half_embed])
+        objectives[1] = np.sum(hidden2[:, half_embed:])
         # Split the embeddings in half for different objective calculations
-        half_embed = self.n_embed // 2
         
+        # breakpoint()
         # Objective 1: Focus on first half of embedding dimensions
-        weighted_sums1 = np.sum(self.W_final[0, :, :half_embed] * hidden2[:, :half_embed], axis=(0, 1))
+        # weighted_sums1 = np.sum(self.W_final[0, :, :half_embed] * hidden2[:, :half_embed], axis=(0, 1))
         
-        # Objective 2: Focus on second half of embedding dimensions
-        weighted_sums2 = np.sum(self.W_final[1, :, half_embed:] * hidden2[:, half_embed:], axis=(0, 1))
+        # # Objective 2: Focus on second half of embedding dimensions
+        # weighted_sums2 = np.sum(self.W_final[1, :, half_embed:] * hidden2[:, half_embed:], axis=(0, 1))
         
-        # Conflict between objectives through highly non-linear transformations
-        objectives[0] = 100 * np.exp(np.sin(weighted_sums1) + self.b_final[0]) 
-        objectives[1] = 100 * np.exp(np.cos(weighted_sums2) + self.b_final[1])
+        # # Conflict between objectives through highly non-linear transformations
+        # objectives[0] = 100 * np.log(np.exp(weighted_sums1 + self.b_final[0]) + 1) 
+        # objectives[1] = 100 * np.log(np.exp(weighted_sums2 + self.b_final[1]) + 1)
         
         # # Additional non-linear interaction between objectives
         # # This creates a more interesting Pareto front shape
@@ -515,8 +518,8 @@ class ComplexCategoryEmbeddingProblem(TestProblem):
         # # Scale objectives to create more diversity
         # objectives[0] = 200 + objectives[0] * 50
         # objectives[1] = 200 + objectives[1] * 50
-        
-        return objectives.tolist()
+        # breakpoint()
+        return objectives.tolist(), hidden2
     
     @property
     def num_objectives(self) -> int:

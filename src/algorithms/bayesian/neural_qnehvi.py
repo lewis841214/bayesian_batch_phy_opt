@@ -34,13 +34,14 @@ from src.algorithms.bayesian.qnehvi import QNEHVI
 class MLP(nn.Module):
     """Multi-layer perceptron for mean function estimation"""
     
-    def __init__(self, input_dim: int, hidden_dims: List[int], output_dim: int = 1, dtype=torch.float64):
+    def __init__(self, input_dim: int, hidden_dims: List[int], hidden_map_dim: Optional[List[int]] = None, output_dim: int = 1, dtype=torch.float64):
         """
         Initialize MLP network
         
         Args:
             input_dim: Input dimension
             hidden_dims: List of hidden layer dimensions
+            hidden_map_dim: Dimensions for the hidden map output (if not None)
             output_dim: Output dimension (typically 1)
             dtype: Data type to use for the model
         """
@@ -48,9 +49,10 @@ class MLP(nn.Module):
         
         self.input_dim = input_dim
         self.output_dim = output_dim
+        self.hidden_map_dim = hidden_map_dim
         self.dtype = dtype
         
-        # Construct layers
+        # Construct layers for main network
         layers = []
         prev_dim = input_dim
         
@@ -60,18 +62,41 @@ class MLP(nn.Module):
             layers.append(nn.ReLU())
             prev_dim = dim
             
-        # Final output layer
-        layers.append(nn.Linear(prev_dim, output_dim, dtype=dtype))
+        # Final output layer for main prediction
+        self.first_half = nn.Sequential(*layers)
+        self.second_half = nn.Linear(prev_dim, output_dim, dtype=dtype)
         
-        # Create sequential model
-        self.model = nn.Sequential(*layers)
-        
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Hidden map prediction network if specified
+        if self.hidden_map_dim is not None:
+            # Create layers for hidden map with dimensions [8, 12]
+            self.map_layer = nn.Linear(prev_dim, self.hidden_map_dim[0] * self.hidden_map_dim[1], dtype=dtype)
+            
+    def forward(self, x: torch.Tensor) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """Forward pass through the network"""
         # Ensure input has the correct dtype
         if x.dtype != self.dtype:
             x = x.to(dtype=self.dtype)
-        return self.model(x)
+        
+        # Forward through shared layers
+        features = self.first_half(x)
+        
+        # Main output prediction
+        output = self.second_half(features)
+        
+        # If hidden map is requested, generate it
+        if self.hidden_map_dim is not None:
+            # Generate flattened map
+            flat_map = self.map_layer(features)
+            
+            # Reshape to proper dimensions [batch_size, 8, 12]
+            batch_size = x.shape[0]
+            hidden_map = flat_map.view(batch_size, self.hidden_map_dim[0], self.hidden_map_dim[1])
+            
+            # Return both outputs
+            return output, hidden_map
+        else:
+            # Return only main output
+            return output
 
 
 # Define a custom mean module for GPyTorch
@@ -103,6 +128,8 @@ class NeuralNetworkMean(gpytorch.means.Mean):
             
         # Get predictions from neural network
         pred = self.nn_model(x)
+        if type(pred) == tuple:
+            pred, hidden_map = pred
         
         # Handle batched inputs from the acquisition function
         if x.dim() == 3:
@@ -202,11 +229,13 @@ class NNQNEHVI(QNEHVI):
         ref_point: Optional[List[float]] = None,
         noise_std: Optional[List[float]] = None,
         mc_samples: int = 128,
+        
         nn_layers: List[int] = [64, 32],
         nn_learning_rate: float = 0.01,
         nn_epochs: int = 300,
         nn_batch_size: int = 16,
         nn_regularization: float = 1e-4,
+        hidden_map_dim: Optional[List[int]] = None,
         **kwargs
     ):
         """
@@ -232,7 +261,11 @@ class NNQNEHVI(QNEHVI):
         self.nn_epochs = nn_epochs
         self.nn_batch_size = nn_batch_size
         self.nn_regularization = nn_regularization
-        
+        self.hidden_map_dim = hidden_map_dim
+
+        # Initialize hidden maps container
+        self.train_hidden_maps = None
+
         # Track model training metrics
         self.model_metrics = {
             'train_losses': [],
@@ -253,7 +286,7 @@ class NNQNEHVI(QNEHVI):
             **kwargs
         )
     
-    def _train_neural_network(self, X: torch.Tensor, y: torch.Tensor, input_dim: int, objective_idx: int) -> nn.Module:
+    def _train_neural_network(self, X: torch.Tensor, y: torch.Tensor, input_dim: int, objective_idx: int, hidden_maps: Optional[torch.Tensor] = None) -> nn.Module:
         """
         Train neural network for mean prediction
         
@@ -262,6 +295,7 @@ class NNQNEHVI(QNEHVI):
             y: Training targets
             input_dim: Input dimension
             objective_idx: Index of the objective this network predicts
+            hidden_maps: Target hidden maps to predict (if not None)
             
         Returns:
             Trained neural network model
@@ -273,10 +307,17 @@ class NNQNEHVI(QNEHVI):
         print(f"Using dtype: {dtype}")
         
         # Create neural network model with the same dtype as the input data
-        model = MLP(input_dim=input_dim, hidden_dims=self.nn_layers, dtype=dtype)
+        model = MLP(
+            input_dim=input_dim, 
+            hidden_dims=self.nn_layers, 
+            hidden_map_dim=self.hidden_map_dim if hidden_maps is not None else None,
+            dtype=dtype
+        )
         
-        # Use MSE loss and Adam optimizer
-        criterion = nn.MSELoss()
+        # Use combined loss: MSE for main prediction plus L2 norm for hidden map
+        mse_criterion = nn.MSELoss()
+        
+        # Define optimizer
         optimizer = optim.Adam(
             model.parameters(), 
             lr=self.nn_learning_rate, 
@@ -292,8 +333,19 @@ class NNQNEHVI(QNEHVI):
         X_train, y_train = X[train_indices], y[train_indices]
         X_val, y_val = X[val_indices], y[val_indices]
         
+        # Split hidden maps if provided
+        hidden_maps_train = None
+        hidden_maps_val = None
+        if hidden_maps is not None:
+            hidden_maps_train = hidden_maps[train_indices]
+            hidden_maps_val = hidden_maps[val_indices]
+        
         # Create data loader for mini-batch training
-        train_dataset = torch.utils.data.TensorDataset(X_train, y_train)
+        if hidden_maps is not None:
+            train_dataset = torch.utils.data.TensorDataset(X_train, y_train, hidden_maps_train)
+        else:
+            train_dataset = torch.utils.data.TensorDataset(X_train, y_train)
+        
         train_loader = torch.utils.data.DataLoader(
             train_dataset, 
             batch_size=min(self.nn_batch_size, len(X_train)),
@@ -306,28 +358,61 @@ class NNQNEHVI(QNEHVI):
         best_val_loss = float('inf')
         best_model_state = None
         
+        # Define map loss weight - adjust this to control importance
+        map_loss_weight = 0.01
+        
         # Use tqdm for progress tracking
         for epoch in tqdm(range(self.nn_epochs), desc=f"NN training (obj {objective_idx+1})"):
             # Training phase
             model.train()
             train_loss = 0.0
             
-            for batch_X, batch_y in train_loader:
-                optimizer.zero_grad()
-                outputs = model(batch_X)
-                loss = criterion(outputs, batch_y)
-                loss.backward()
-                optimizer.step()
-                train_loss += loss.item() * batch_X.size(0)
-                
+            # Handle different batch structures based on hidden map presence
+            if hidden_maps is not None:
+                for batch_X, batch_y, batch_maps in train_loader:
+                    optimizer.zero_grad()
+                    
+                    # Forward pass - returns both predictions
+                    outputs, predicted_maps = model(batch_X)
+                    # Calculate losses
+                    main_loss = mse_criterion(outputs, batch_y)
+                    map_loss = torch.mean((predicted_maps - batch_maps) ** 2)
+                    
+                    # Combined loss
+                    loss = main_loss + map_loss_weight * map_loss
+                    
+                    loss.backward()
+                    optimizer.step()
+                    train_loss += loss.item() * batch_X.size(0)
+            else:
+                for batch_X, batch_y in train_loader:
+                    optimizer.zero_grad()
+                    outputs = model(batch_X)
+                    loss = mse_criterion(outputs, batch_y)
+                    loss.backward()
+                    optimizer.step()
+                    train_loss += loss.item() * batch_X.size(0)
+            
             train_loss /= len(X_train)
             train_losses.append(train_loss)
             
             # Validation phase
             model.eval()
             with torch.no_grad():
-                val_outputs = model(X_val)
-                val_loss = criterion(val_outputs, y_val).item()
+                if hidden_maps is not None:
+                    # Model returns both outputs and maps
+                    val_outputs, val_predicted_maps = model(X_val)
+                    
+                    # Calculate losses
+                    val_main_loss = mse_criterion(val_outputs, y_val)
+                    val_map_loss = torch.mean((val_predicted_maps - hidden_maps_val) ** 2)
+                    
+                    # Combined loss
+                    val_loss = val_main_loss + map_loss_weight * val_map_loss
+                else:
+                    val_outputs = model(X_val)
+                    val_loss = mse_criterion(val_outputs, y_val).item()
+                
                 val_losses.append(val_loss)
                 
                 # Save best model
@@ -337,7 +422,11 @@ class NNQNEHVI(QNEHVI):
             
             # Print progress every 10 epochs
             if (epoch + 1) % 100 == 0 or epoch == 0:
-                print(f"Epoch {epoch+1}/{self.nn_epochs}, Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}")
+                if hidden_maps is not None:
+                    print(f"Epoch {epoch+1}/{self.nn_epochs}, Train Loss: {train_loss:.6f}, "
+                          f"Val Loss: {val_loss:.6f} (Main: {val_main_loss:.6f}, Map: {val_map_loss:.6f})")
+                else:
+                    print(f"Epoch {epoch+1}/{self.nn_epochs}, Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}")
         
         # Load best model
         if best_model_state is not None:
@@ -352,7 +441,6 @@ class NNQNEHVI(QNEHVI):
             self.model_metrics['val_losses'][objective_idx] = val_losses
             
         print(f"Neural network training completed. Final val loss: {best_val_loss:.6f}")
-        # breakpoint()
         return model
         
     def _update_model(self, output_dir=None):
@@ -381,7 +469,10 @@ class NNQNEHVI(QNEHVI):
             
             # Train neural network for mean prediction
             input_dim = X.shape[1]
-            nn_model = self._train_neural_network(X, y.unsqueeze(-1), input_dim, i)  # Pass 2D for training
+            if self.train_hidden_maps is not None:
+                nn_model = self._train_neural_network(X, y.unsqueeze(-1), input_dim, i, self.train_hidden_maps)  # Pass 2D for training
+            else:
+                nn_model = self._train_neural_network(X, y.unsqueeze(-1), input_dim, i)  # Pass 2D for training
             self.nn_models.append(nn_model)
             
             # Create GP model with neural network mean
@@ -417,16 +508,13 @@ class NNQNEHVI(QNEHVI):
         
         # Create prediction vs true plots if output_dir is provided and we have enough data
         if output_dir is not None and len(self.train_x) >= 5:
-            try:
-                plots_dir = os.path.join(output_dir, "model_plots")
-                iter_num = len(self.timing_history['model_update'])
-                # Use perturbation sampling by default to test generalization around existing points
-                # And use true evaluation values (not random values)
-                self.plot_true_vs_predicted(plots_dir, iter_num, use_random_values=False, sample_method="random")
-                print(f"Model prediction plots saved to {plots_dir}")
-            except Exception as e:
-                print(f"Warning: Could not create model prediction plots: {e}")
-                print("Continuing optimization without plots...")
+            plots_dir = os.path.join(output_dir, "model_plots")
+            iter_num = len(self.timing_history['model_update'])
+            # Use perturbation sampling by default to test generalization around existing points
+            # And use true evaluation values (not random values)
+            self.plot_true_vs_predicted(plots_dir, iter_num, use_random_values=False, sample_method="random")
+            print(f"Model prediction plots saved to {plots_dir}")
+        
         
         return model_list
     
@@ -639,6 +727,70 @@ class NNQNEHVI(QNEHVI):
         
         # Return a batch of candidates (ensuring we don't exceed batch size)
         return candidate_dicts[:effective_batch_size] 
+
+    def tell(self, xs: List[Dict[str, Any]], ys: List[List[float]], hidden_maps = None):
+        """Update model with evaluated points"""
+        # Update budget tracking
+        self.evaluated_points += len(xs)
+        print(f"Tell called with {len(xs)} points. Total evaluated: {self.evaluated_points}/{self.budget}")
+        
+        # Convert parameter dictionaries to tensors
+        x_tensors = []
+        for x in xs:
+            # Extract parameter values in the correct order
+            x_values = []
+            for name in self.parameter_space.parameters:
+                param_config = self.parameter_space.parameters[name]
+                value = x[name]
+                
+                if param_config['type'] == 'continuous':
+                    x_values.append(float(value))
+                elif param_config['type'] == 'integer':
+                    x_values.append(float(value))
+                elif param_config['type'] == 'categorical':
+                    # Map category to integer
+                    cat_map = self.adapter.botorch_space['categorical_maps'][name]['reverse_map']
+                    x_values.append(float(cat_map[value]))
+            
+            x_tensors.append(torch.tensor(x_values, dtype=torch.double))
+        
+        # Stack tensors
+        x_tensor = torch.stack(x_tensors)
+        y_tensor = torch.tensor(ys, dtype=torch.double)
+        
+        # Add to training data
+        self.train_x = torch.cat([self.train_x, x_tensor])
+        self.train_y = torch.cat([self.train_y, y_tensor])
+        
+        # Handle hidden maps if provided
+        if hidden_maps is not None:
+            # Convert numpy arrays to torch tensors
+            hidden_maps_tensors = []
+            for h_map in hidden_maps:
+                # Check if it's a numpy array and convert to tensor
+                if isinstance(h_map, np.ndarray):
+                    h_map_tensor = torch.tensor(h_map, dtype=torch.float32)
+                    hidden_maps_tensors.append(h_map_tensor)
+                elif isinstance(h_map, torch.Tensor):
+                    hidden_maps_tensors.append(h_map)
+                else:
+                    print(f"Unsupported hidden_map type: {type(h_map)}. Skipping.")
+            
+            if hidden_maps_tensors:
+                # Stack all tensors
+                stacked_hidden_maps = torch.stack(hidden_maps_tensors)
+                
+                if self.train_hidden_maps is None:
+                    self.train_hidden_maps = stacked_hidden_maps
+                else:
+                    self.train_hidden_maps = torch.cat([self.train_hidden_maps, stacked_hidden_maps], dim=0)
+                
+                print(f"Added hidden maps with shape: {stacked_hidden_maps.shape}")
+            else:
+                print("No valid hidden maps to add.")
+        else:
+            print("No hidden maps provided in tell() method.")
+
 
     def recommend(self) -> Tuple[List[Dict[str, Any]], List[List[float]]]:
         """Return current Pareto front"""
@@ -982,11 +1134,16 @@ class NNQNEHVI(QNEHVI):
                                     complete_test_dict[param] = param_config['values'][0]
                                     
                         # Evaluate with the complete parameter set
-                        true_values.append(test_problem.evaluate(complete_test_dict))
+                        test_result = test_problem.evaluate(complete_test_dict)
+                        if type(test_result) == tuple:
+                            true_values.append(test_result[0])
+                        else:
+                            true_values.append(test_result)
                     
                     true_np = np.array(true_values)
                 except Exception as e:
                     print(f"Error evaluating test points: {e}")
+                    breakpoint()
                     print("Falling back to random values for true evaluations")
                     true_np = np.random.rand(n_test_points, self.n_objectives) * 10
                     
@@ -1008,6 +1165,11 @@ class NNQNEHVI(QNEHVI):
             with torch.no_grad():
                 # Use the neural network directly for predictions
                 nn_pred = nn_model(X_norm_test)
+                if type(nn_pred) == tuple:
+                    nn_pred, hidden_map = nn_pred
+
+                if type(nn_pred) == tuple:
+                    nn_pred, hidden_map = nn_pred
                 # Make sure output is the right shape
                 if nn_pred.dim() > 1 and nn_pred.shape[1] == 1:
                     nn_pred = nn_pred.squeeze(-1)
@@ -1030,6 +1192,8 @@ class NNQNEHVI(QNEHVI):
             for i, nn_model in enumerate(self.nn_models):
                 # Use the neural network directly for predictions
                 nn_pred = nn_model(X_norm_train)
+                if type(nn_pred) == tuple:
+                    nn_pred, hidden_map = nn_pred
                 # Make sure output is the right shape
                 if nn_pred.dim() > 1 and nn_pred.shape[1] == 1:
                     nn_pred = nn_pred.squeeze(-1)

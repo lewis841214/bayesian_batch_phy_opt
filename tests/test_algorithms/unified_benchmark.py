@@ -23,10 +23,12 @@ def run_optimization(algorithm_name, problem_name, budget, batch_size, output_di
     
     # Get test problem
     problem = get_test_problem(problem_name)
-    
-    # Get algorithm adapter
     adapter = get_algorithm_adapter(algorithm_name)
-    adapter.setup(problem, budget, batch_size)
+
+    if 'hidden_map_dim' in problem.__dict__ and algorithm_name == 'nn-qnehvi':
+        adapter.setup(problem, budget, batch_size, hidden_map_dim=problem.hidden_map_dim)
+    else:
+        adapter.setup(problem, budget, batch_size)
     
     # Run optimization
     start_time = time.time()
@@ -73,9 +75,19 @@ def run_optimization(algorithm_name, problem_name, budget, batch_size, output_di
         
         # Evaluate candidates
         values = []
+        hidden_maps = []
         for i, candidate in enumerate(tqdm(candidates[:current_batch], desc="Evaluating candidates", leave=False)):
             value = problem.evaluate(candidate)
+            if type(value) == tuple:
+                if algorithm_name != 'nn-qnehvi':
+                    value = value[0]
+                else:
+                    hidden_map= value[1]
+                    value = value[0]
+                    hidden_maps.append(hidden_map)
+
             values.append(value)
+            
             
             # Store all evaluated points
             all_evaluated_x.append(candidate)
@@ -83,7 +95,11 @@ def run_optimization(algorithm_name, problem_name, budget, batch_size, output_di
         
         # Update algorithm
         tqdm.write(f"Updating model with {current_batch} evaluations...")
-        adapter.tell(candidates[:current_batch], values)
+
+        if algorithm_name == 'nn-qnehvi' and hidden_maps:
+            adapter.tell(candidates[:current_batch], values, hidden_maps)
+        else:
+            adapter.tell(candidates[:current_batch], values)
         
         # Update budget and progress bar
         remaining_budget -= current_batch

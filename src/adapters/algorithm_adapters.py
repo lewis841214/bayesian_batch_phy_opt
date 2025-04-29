@@ -67,9 +67,12 @@ class BayesianOptAdapter(AlgorithmAdapter):
             return self.algorithm.ask(output_dir=output_dir)
         return self.algorithm.ask()
     
-    def tell(self, x, y):
+    def tell(self, x, y, hidden_maps=None):
         """Update with evaluated solutions"""
-        self.algorithm.tell(x, y)
+        if hidden_maps is not None:
+            self.algorithm.tell(x, y, hidden_maps)
+        else:
+            self.algorithm.tell(x, y)
     
     def get_result(self):
         """Return current result"""
