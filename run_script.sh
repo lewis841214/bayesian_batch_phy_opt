@@ -18,9 +18,9 @@ python tests/test_algorithms/unified_benchmark.py --compare --algorithms randoms
 
 python tests/test_algorithms/unified_benchmark.py --compare --algorithms randomsearch nsga2 nsga3 moead  qnehvi nn-qnehvi --problem complex_categorical --budget 200 --batch-size 10 --output-dir output/nn_complex_categorical_hidden_map_8_3_200
 
-python tests/test_algorithms/unified_benchmark.py --compare --algorithms  nnk-qnehvi --problem complex_categorical --budget 20 --batch-size 10 --output-dir output/nnK
+python tests/test_algorithms/unified_benchmark.py --compare --algorithms  qnehvi nnk-qnehvi --problem complex_categorical --budget 200 --batch-size 10 --output-dir output/nnK_6_3
 
-
+ python tests/test_algorithms/unified_benchmark.py --compare --algorithms  randomsearch nsga2 nsga3 moead qnehvi nnk-qnehvi --problem complex_categorical --budget 200 --batch-size 10 --output-dir output/nnK_10_3_1lay_30
 # randomsearch nsga2 nsga3 moead  qnehvi nn-qnehvi
 
 mixed': MixedParameterTestProblem(),

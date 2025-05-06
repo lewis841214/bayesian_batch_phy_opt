@@ -362,7 +362,7 @@ class NNKernelQNEHVI(QNEHVI):
         
         # Create neural network model with the same dtype as the input data
         model = MLP(
-            input_dim=input_dim, 
+            input_dim=input_dim,
             hidden_dims=self.nn_layers, 
             hidden_map_dim=self.hidden_map_dim if hidden_maps is not None else None,
             dtype=dtype,
@@ -409,18 +409,6 @@ class NNKernelQNEHVI(QNEHVI):
         else:
             X_train_noisy = X_train
         
-        # Create data loader for mini-batch training
-        if hidden_maps is not None:
-            train_dataset = torch.utils.data.TensorDataset(X_train_noisy, y_train, hidden_maps_train)
-        else:
-            train_dataset = torch.utils.data.TensorDataset(X_train_noisy, y_train)
-        
-        train_loader = torch.utils.data.DataLoader(
-            train_dataset, 
-            batch_size=min(self.nn_batch_size, len(X_train)),
-            shuffle=True
-        )
-        
         # Training loop
         train_losses = []
         val_losses = []
@@ -431,68 +419,74 @@ class NNKernelQNEHVI(QNEHVI):
         patience = 50
         patience_counter = 0
         
-        # Define map loss weight - adjust this to control importance
-        map_loss_weight = 0.01
-        
+        VC = VarianceCalculator()
+
+        if hidden_maps is not None:
+            # Calculate pairwise distance matrix between maps
+            # Convert PyTorch tensors to numpy arrays for VarianceCalculator
+            train_maps_np = hidden_maps_train.detach().cpu().numpy()
+            
+            # Each map should be a 2D grid for the 2D Wasserstein distance calculation
+            maps_list = [train_maps_np[i] for i in range(train_maps_np.shape[0])]
+            
+            # Calculate pairwise distances between maps
+            # This returns a distance matrix of shape [batch_size, batch_size]
+            map_distance_matrix = VC.calculate_pairwise_2d_distribution_distance(
+                maps_list, 
+                method='sliced',
+                num_projections=20,
+                target_size=None
+            )['distance_matrix']
+            
+            # Convert distance matrix to similarity matrix in PyTorch
+            map_distance_tensor = torch.tensor(map_distance_matrix, dtype=dtype)
+            
+            # Handle potential NaN values in the distance matrix
+            map_distance_tensor = torch.nan_to_num(map_distance_tensor, nan=0.0)
         # Use tqdm for progress tracking
         for epoch in tqdm(range(self.nn_epochs), desc=f"NN training (obj {objective_idx+1})"):
             # Training phase
             model.train()
-            train_loss = 0.0
             
-            # Handle different batch structures based on hidden map presence
             if hidden_maps is not None:
                 # Create VarianceCalculator for map distance calculation
-                VC = VarianceCalculator()
                 
-                for batch_X, batch_y, batch_maps in train_loader:
-                    optimizer.zero_grad()
-                    
-                    # Forward pass - returns outputs (embeddings)
-                    outputs = model(batch_X)
-                    
-                    # Calculate pairwise distance matrix between maps in the batch
-                    # Convert PyTorch tensors to numpy arrays for VarianceCalculator
-                    batch_maps_np = batch_maps.detach().cpu().numpy()
-                    
-                    # Need to reshape the maps if needed (assuming batch_maps is [batch_size, map_h, map_w])
-                    # Each map should be a 2D grid for the 2D Wasserstein distance calculation
-                    maps_list = [batch_maps_np[i] for i in range(batch_maps_np.shape[0])]
-                    
-                    # Calculate pairwise distances between maps
-                    # This returns a distance matrix of shape [batch_size, batch_size]
-                    map_distance_matrix = VC.calculate_pairwise_2d_distribution_distance(
-                        maps_list, 
-                        method= 'sliced', # 'sliced', 'mmd_1d'
-                        num_projections=20,
-                        target_size=None
-                    )['distance_matrix']
-                    # Convert distance matrix to similarity matrix in PyTorch
-                    # Invert and normalize distances to similarities (closer = more similar)
-                    map_distance_tensor = torch.tensor(map_distance_matrix, dtype=dtype)
-                    
-                    # Handle potential NaN values in the distance matrix
-                    map_distance_tensor = torch.nan_to_num(map_distance_tensor, nan=0.0)
-                    
-                    # Calculate the embedding similarity matrix using cosine similarity
-                    # Cosine is more stable than dot product for similarity
-                    normalized_embeddings = F.normalize(outputs, p=2, dim=1)
-                    embedding_similarity = torch.mm(normalized_embeddings, normalized_embeddings.t())
-                    
-                    # Normalize map distances (smaller distance = higher similarity)
-                    # Add small constant to avoid division by zero
-                    eps = 1e-8
-                    map_max_dist = torch.max(map_distance_tensor) + eps
-                    map_similarity = 1.0 - (map_distance_tensor / map_max_dist)
-                    
-                    # Calculate similarity loss (MSE between the two similarity matrices)
-                    loss = F.mse_loss(embedding_similarity, map_similarity.to(embedding_similarity.device, dtype=embedding_similarity.dtype))
-                    
-                    loss.backward()
-                    optimizer.step()
-                    train_loss += loss.item() * batch_X.size(0)
+                
+                # Zero gradients
+                optimizer.zero_grad()
+                
+                # Forward pass - returns outputs (embeddings)
+                outputs = model(X_train_noisy)
+                
+                # Calculate the embedding similarity matrix using cosine similarity
+                normalized_embeddings = F.normalize(outputs, p=2, dim=1)
+                embedding_similarity = torch.mm(normalized_embeddings, normalized_embeddings.t())
+                
+                # Normalize map distances (smaller distance = higher similarity)
+                eps = 1e-8
+                map_max_dist = torch.max(map_distance_tensor) + eps
+                map_similarity = 1.0 - (map_distance_tensor / map_max_dist)
+                
+                # Calculate similarity loss (MSE between the two similarity matrices)
+                loss = F.mse_loss(
+                    embedding_similarity, 
+                    map_similarity.to(embedding_similarity.device, dtype=embedding_similarity.dtype)
+                )
+                
+                # Backward pass and optimize
+                loss.backward()
+                optimizer.step()
+                
+                train_loss = loss.item()
+            else:
+                # If no hidden maps, use direct prediction (though this branch is not typically used)
+                optimizer.zero_grad()
+                outputs = model(X_train_noisy)
+                loss = mse_criterion(outputs, y_train.to(outputs.dtype))
+                loss.backward()
+                optimizer.step()
+                train_loss = loss.item()
             
-            train_loss /= len(X_train)
             train_losses.append(train_loss)
             
             # Validation phase
@@ -500,8 +494,8 @@ class NNKernelQNEHVI(QNEHVI):
             with torch.no_grad():
                 if hidden_maps is not None:
                     # Extract validation maps
-                    hidden_maps_val_np = hidden_maps_val.detach().cpu().numpy()
-                    maps_list_val = [hidden_maps_val_np[i] for i in range(hidden_maps_val_np.shape[0])]
+                    val_maps_np = hidden_maps_val.detach().cpu().numpy()
+                    maps_list_val = [val_maps_np[i] for i in range(val_maps_np.shape[0])]
                     
                     # Calculate map distance matrix for validation data
                     val_map_distance_matrix = VC.calculate_pairwise_2d_distribution_distance(
@@ -558,11 +552,7 @@ class NNKernelQNEHVI(QNEHVI):
             
             # Print progress periodically
             if (epoch + 1) % 10 == 0 or epoch == 0:
-                if hidden_maps is not None:
-                    print(f"Epoch {epoch+1}/{self.nn_epochs}, Train Loss: {train_loss:.6f}, "
-                          f"Val Loss: {val_loss:.6f}")
-                else:
-                    print(f"Epoch {epoch+1}/{self.nn_epochs}, Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}")
+                print(f"Epoch {epoch+1}/{self.nn_epochs}, Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}")
         
         # Load best model
         if best_model_state is not None:

@@ -21,11 +21,11 @@ class QNEHVIHybridAdapter(BayesianOptAdapter):
             nn_config: Optional configuration for neural network
         """
         self.nn_config = nn_config or {
-            'hidden_layers': [12], # [10, 10], two hidden layers, each with 10 neurons
+            'hidden_layers': [30], # 12
             'learning_rate': 0.01,
-            'epochs': 100,
-            'batch_size': 100,
-            'regularization': 1e-4
+            'epochs': 500, # 100
+            'batch_size': 200, # 100
+            'regularization': 1e-5 # 1e-4
         }
         
         self.algorithm_name = algorithm_name
