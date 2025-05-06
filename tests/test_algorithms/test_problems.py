@@ -386,7 +386,7 @@ class ComplexCategoryEmbeddingProblem(TestProblem):
     
     def __init__(self, n_embed=12):
         # Number of parameters and options
-        self.num_params = 9
+        self.num_params = 4
         self.num_options = 3
         self.n_embed = n_embed
         self.hidden_map_dim = [8, 12]
@@ -483,15 +483,15 @@ class ComplexCategoryEmbeddingProblem(TestProblem):
         # Second layer: [8 x 12] x [12 x n_embed] = [8 x n_embed]
         hidden2 = np.dot(self.W2, hidden1)
         # Apply Tanh activation
-        hidden2 = np.tanh(hidden2)
+        hidden2 = np.abs(np.tanh(hidden2))
         half_embed = self.n_embed // 2
 
         
         # Final layer - produce 2 objective values
         # For each objective, apply a different transformation
         objectives = np.zeros(2)
-        objectives[0] = np.sum(hidden2[:, :half_embed])
-        objectives[1] = np.sum(hidden2[:, half_embed:])
+        objectives[0] = np.sum(hidden2[:, :half_embed]) + 30
+        objectives[1] = np.sum(hidden2[:, half_embed:]) + 30
         # Split the embeddings in half for different objective calculations
         
         # breakpoint()
@@ -518,7 +518,6 @@ class ComplexCategoryEmbeddingProblem(TestProblem):
         # # Scale objectives to create more diversity
         # objectives[0] = 200 + objectives[0] * 50
         # objectives[1] = 200 + objectives[1] * 50
-        # breakpoint()
         return objectives.tolist(), hidden2
     
     @property

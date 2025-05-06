@@ -2,6 +2,7 @@ import numpy as np
 from typing import Dict, List, Any, Optional, Tuple, Union, Type
 
 from src.algorithms.bayesian.qnehvi import QNEHVI
+from src.algorithms.bayesian.nnkernel_qnehvi import NNKernelQNEHVI
 # from src.algorithms.bayesian.qehvi import QEHVI
 # from src.algorithms.bayesian.qparego import QNParEGO
 
@@ -178,7 +179,11 @@ class EvolutionaryAdapter(AlgorithmAdapter):
                             params[name] = self.categorical_mappings[j][cat_idx]
                     
                     # Evaluate
-                    f = self.test_problem.evaluate(params)
+                    test_result = self.test_problem.evaluate(params)
+                    if type(test_result) == tuple:
+                        f = test_result[0]
+                    else:
+                        f = test_result
                     f_values.append(f)
                 
                 out["F"] = np.array(f_values) * -1  # Negate for maximization
@@ -428,7 +433,10 @@ def get_algorithm_adapter(algorithm_name: str) -> AlgorithmAdapter:
     # Special case for hybrid methods
     elif algorithm_name == 'nn-qnehvi':
         from src.adapters.qnehvi_hybrid_adapter import QNEHVIHybridAdapter
-        return QNEHVIHybridAdapter(surrogate_model="nn")
+        return QNEHVIHybridAdapter(algorithm_name='nn-qnehvi')
+    elif algorithm_name == 'nnk-qnehvi':
+        from src.adapters.qnehvi_hybrid_adapter import QNEHVIHybridAdapter
+        return QNEHVIHybridAdapter(algorithm_name='nnk-qnehvi' )
     elif algorithm_name == 'xgb-qnehvi':
         from src.adapters.qnehvi_hybrid_adapter import QNEHVIHybridAdapter
         return QNEHVIHybridAdapter(surrogate_model="xgboost")

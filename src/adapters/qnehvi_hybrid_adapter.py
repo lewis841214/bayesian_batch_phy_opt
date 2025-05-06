@@ -2,6 +2,7 @@ from typing import Dict, List, Any, Optional, Tuple, Union
 
 from src.adapters.algorithm_adapters import BayesianOptAdapter
 from src.algorithms.bayesian.neural_qnehvi import NNQNEHVI
+from src.algorithms.bayesian.nnkernel_qnehvi import NNKernelQNEHVI
 
 class QNEHVIHybridAdapter(BayesianOptAdapter):
     """
@@ -11,7 +12,7 @@ class QNEHVIHybridAdapter(BayesianOptAdapter):
     with the standard qNEHVI algorithm for multi-objective optimization.
     """
     
-    def __init__(self, surrogate_model="nn", nn_config=None):
+    def __init__(self, algorithm_name = 'nn-qnehvi', nn_config=None): # 'nn-qnehvi', 'nnk-qnehvi'
         """
         Initialize adapter with neural network configuration
         
@@ -19,17 +20,21 @@ class QNEHVIHybridAdapter(BayesianOptAdapter):
             surrogate_model: Type of surrogate model to use ('nn' or 'xgboost')
             nn_config: Optional configuration for neural network
         """
-        self.surrogate_model = surrogate_model
         self.nn_config = nn_config or {
-            'hidden_layers': [100, 100, 20], # [10, 10], two hidden layers, each with 10 neurons
+            'hidden_layers': [12], # [10, 10], two hidden layers, each with 10 neurons
             'learning_rate': 0.01,
-            'epochs': 3000,
+            'epochs': 100,
             'batch_size': 100,
             'regularization': 1e-4
         }
         
-        # Initialize with NNQNEHVI algorithm class
-        super().__init__(NNQNEHVI)
+        self.algorithm_name = algorithm_name
+        if self.algorithm_name == 'nn-qnehvi':
+            # Initialize with NNQNEHVI algorithm class
+            super().__init__(NNQNEHVI)
+        elif self.algorithm_name == 'nnk-qnehvi':
+            # Initialize with NNQNEHVI algorithm class
+            super().__init__(NNKernelQNEHVI)
     
     def setup(self, problem, budget, batch_size, hidden_map_dim=None):
         """
@@ -46,25 +51,43 @@ class QNEHVIHybridAdapter(BayesianOptAdapter):
         parameter_space = problem.get_parameter_space()
         ref_point = problem.get_reference_point()
         
+        if self.algorithm_name == 'nn-qnehvi':
         # Initialize algorithm with neural network configuration
-        self.algorithm = NNQNEHVI(
-            parameter_space=parameter_space,
-            budget=budget,
-            batch_size=batch_size,
-            n_objectives=problem.num_objectives,
-            ref_point=ref_point,
-            mc_samples=128,
-            
+            self.algorithm = NNQNEHVI(
+                parameter_space=parameter_space,
+                budget=budget,
+                batch_size=batch_size,
+                n_objectives=problem.num_objectives,
+                ref_point=ref_point,
+                mc_samples=128,
+                
 
-            # Neural network specific parameters
-            nn_layers=self.nn_config['hidden_layers'],
-            nn_learning_rate=self.nn_config['learning_rate'],
-            nn_epochs=self.nn_config['epochs'],
-            nn_batch_size=self.nn_config['batch_size'],
-            nn_regularization=self.nn_config['regularization'],
-            hidden_map_dim=hidden_map_dim,
-        )
-        
+                # Neural network specific parameters
+                nn_layers=self.nn_config['hidden_layers'],
+                nn_learning_rate=self.nn_config['learning_rate'],
+                nn_epochs=self.nn_config['epochs'],
+                nn_batch_size=self.nn_config['batch_size'],
+                nn_regularization=self.nn_config['regularization'],
+                hidden_map_dim=hidden_map_dim,
+            )
+        elif self.algorithm_name == 'nnk-qnehvi':
+            self.algorithm = NNKernelQNEHVI(
+                parameter_space=parameter_space,
+                budget=budget,
+                batch_size=batch_size,
+                n_objectives=problem.num_objectives,
+                ref_point=ref_point,
+                mc_samples=128,
+                
+
+                # Neural network specific parameters
+                nn_layers=self.nn_config['hidden_layers'],
+                nn_learning_rate=self.nn_config['learning_rate'],
+                nn_epochs=self.nn_config['epochs'],
+                nn_batch_size=self.nn_config['batch_size'],
+                nn_regularization=self.nn_config['regularization'],
+                hidden_map_dim=hidden_map_dim,
+            )
         return self
     
     def ask(self, output_dir=None):

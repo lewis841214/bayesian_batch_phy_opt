@@ -3,6 +3,7 @@ import numpy as np
 from typing import List, Dict, Any, Optional, Tuple, Union
 import gpytorch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 import os
 import botorch
@@ -28,15 +29,14 @@ from src.core.algorithm import MultiObjectiveOptimizer
 from src.core.parameter_space import ParameterSpace
 from src.adapters.botorch_adapter import BoTorchAdapter
 from src.algorithms.bayesian.qnehvi import QNEHVI
-
+from src.utils.variance_calculator import VarianceCalculator
 
 # Define the neural network model for mean prediction
 class MLP(nn.Module):
-    """Multi-layer perceptron for mean function estimation"""
+    """Multi-layer perceptron for feature mapping in kernel space"""
     
     def __init__(self, input_dim: int, hidden_dims: List[int], hidden_map_dim: Optional[List[int]] = None, 
-                 output_dim: int = 1, dtype=torch.float64, dropout_rate: float = 0.2,
-                 output_range: Optional[Tuple[List[float], List[float]]] = None):
+                 output_dim: int = 1, dtype=torch.float64, dropout_rate: float = 0.2):
         """
         Initialize MLP network
         
@@ -47,7 +47,6 @@ class MLP(nn.Module):
             output_dim: Output dimension (typically 1)
             dtype: Data type to use for the model
             dropout_rate: Dropout rate for regularization
-            output_range: Optional min/max values for outputs in format ([min1, min2, ...], [max1, max2, ...])
         """
         super().__init__()
         
@@ -56,206 +55,220 @@ class MLP(nn.Module):
         self.hidden_map_dim = hidden_map_dim
         self.dtype = dtype
         self.dropout_rate = dropout_rate
-        self.output_range = output_range
         
-        # Construct layers for main network
+        # Construct a simpler network with fewer layers and less regularization
         layers = []
         prev_dim = input_dim
         
-        for dim in hidden_dims:
-            # Add batch normalization before each linear layer (except first)
-            if prev_dim != input_dim:
-                layers.append(nn.BatchNorm1d(prev_dim, dtype=dtype))
-            
+        for i, dim in enumerate(hidden_dims):
             # Linear layer
             layer = nn.Linear(prev_dim, dim, dtype=dtype)
             layers.append(layer)
             
-            # Activation and dropout
-            layers.append(nn.LeakyReLU(0.1))  # LeakyReLU instead of ReLU
-            layers.append(nn.Dropout(dropout_rate))
+            # Initialize with small weights but non-zero (orthogonal initialization)
+            nn.init.orthogonal_(layer.weight, gain=0.8)
+            nn.init.zeros_(layer.bias)
+            
+            # Activation - use TanH instead of LeakyReLU for better stability and bounded outputs
+            layers.append(nn.Tanh())
+            
+            # Use less dropout
+            if i < len(hidden_dims) - 1:  # No dropout before final output
+                layers.append(nn.Dropout(dropout_rate * 0.5))
             
             prev_dim = dim
         
-        # Add final batch norm before output
-        layers.append(nn.BatchNorm1d(prev_dim, dtype=dtype))
+        # Final output layer for embedding
+        self.feature_extractor = nn.Sequential(*layers)
+        self.output_layer = nn.Linear(prev_dim, output_dim, dtype=dtype)
+        nn.init.orthogonal_(self.output_layer.weight, gain=0.8)
+        nn.init.zeros_(self.output_layer.bias)
         
-        # Final output layer for main prediction
-        self.first_half = nn.Sequential(*layers)
-        self.second_half = nn.Linear(prev_dim, output_dim, dtype=dtype)
-        
-        # Hidden map prediction network if specified
-        if self.hidden_map_dim is not None:
-            # Create layers for hidden map with dimensions [8, 12]
-            self.map_layer = nn.Linear(prev_dim, self.hidden_map_dim[0] * self.hidden_map_dim[1], dtype=dtype)
-            
     def forward(self, x: torch.Tensor) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """Forward pass through the network"""
         # Ensure input has the correct dtype
         if x.dtype != self.dtype:
             x = x.to(dtype=self.dtype)
         
-        # Forward through shared layers
-        features = self.first_half(x)
+        # Forward through feature extractor
+        features = self.feature_extractor(x)
         
-        # Main output prediction
-        output = self.second_half(features)
+        # Through output layer
+        output = self.output_layer(features)
         
-        # Apply output range constraint if specified
-        if self.output_range is not None:
-            mins, maxs = self.output_range
-            
-            # Convert to tensors if they're not already
-            if not isinstance(mins, torch.Tensor):
-                mins = torch.tensor(mins, dtype=self.dtype, device=output.device)
-            if not isinstance(maxs, torch.Tensor):
-                maxs = torch.tensor(maxs, dtype=self.dtype, device=output.device)
-                
-            # Ensure proper dimensions
-            if mins.dim() == 1:
-                mins = mins.unsqueeze(0)
-            if maxs.dim() == 1:
-                maxs = maxs.unsqueeze(0)
-                
-            # Apply sigmoid scaling to constrain output to range
-            # sigmoid(x) * (max - min) + min maps any real value to [min, max]
-            output = torch.sigmoid(output) * (maxs - mins) + mins
-        
-        # If hidden map is requested, generate it
-        if self.hidden_map_dim is not None:
-            # Generate flattened map
-            flat_map = self.map_layer(features)
-            
-            # Reshape to proper dimensions [batch_size, 8, 12]
-            batch_size = x.shape[0]
-            hidden_map = flat_map.view(batch_size, self.hidden_map_dim[0], self.hidden_map_dim[1])
-            
-            # Return both outputs
-            return output, hidden_map
-        else:
-            # Return only main output
-            return output
+        return output
 
 
-# Define a custom mean module for GPyTorch
-class NeuralNetworkMean(gpytorch.means.Mean):
+# Add this after MLP class and before NeuralNetworkMean class
+
+class PhiKernel(gpytorch.kernels.Kernel):
     """
-    Neural network mean module for GPyTorch models.
+    Kernel that uses a pretrained phi network to transform inputs before computing distances.
     
-    This allows the GP to use a neural network for mean prediction
-    while maintaining standard GP variance/uncertainty.
+    This allows for complex, non-linear feature mapping in kernel space.
     """
     
-    def __init__(self, nn_model: nn.Module, target_dim=None):
-        """
-        Initialize with a neural network model
+    def __init__(self, phi_network, base_kernel=None, jitter=1e-4, **kwargs):
+        """Initialize with phi network for feature transformation"""
+        super().__init__(**kwargs)
+        self.phi_network = phi_network
+        self.jitter = jitter
         
-        Args:
-            nn_model: PyTorch neural network model
-            target_dim: Expected dimension of output (1D or 2D)
-        """
-        super().__init__()
-        self.nn_model = nn_model
-        self.target_dim = target_dim
-        
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass through the neural network"""
-        # Ensure inputs have correct dtype
-        if x.dtype != next(self.nn_model.parameters()).dtype:
-            x = x.to(dtype=next(self.nn_model.parameters()).dtype)
-            
-        # Get predictions from neural network
-        pred = self.nn_model(x)
-        if type(pred) == tuple:
-            pred, hidden_map = pred
-        
-        # Handle batched inputs from the acquisition function
-        if x.dim() == 3:
-            # If model outputs 1D, expand to match targets
-            if pred.dim() == 2 and self.target_dim == 1:
-                return pred.squeeze(-1)
-            # If model outputs 2D but targets are 1D, squeeze last dim
-            elif pred.dim() == 3 and self.target_dim == 1:
-                return pred.squeeze(-1)
-            # Default: return as is
-            return pred
+        # Use RBF as default base kernel if none provided
+        if base_kernel is None:
+            self.base_kernel = gpytorch.kernels.RBFKernel()
         else:
-            # If model outputs [n,1] but targets are [n]
-            if pred.dim() == 2 and self.target_dim == 1:
-                return pred.squeeze(-1)
-            # If model outputs [n] but targets are [n,1]
-            elif pred.dim() == 1 and self.target_dim == 2:
-                return pred.unsqueeze(-1)
-            # Default
-            return pred
+            self.base_kernel = base_kernel
+    
+    def forward(self, x1, x2=None, diag=False, **params):
+        """Apply phi transformation then compute kernel"""
+        # Project inputs through phi network
+        with torch.no_grad():
+            if x1.dtype != next(self.phi_network.parameters()).dtype:
+                x1 = x1.to(dtype=next(self.phi_network.parameters()).dtype)
+            
+            # Get embeddings without normalization to preserve the learned structure
+            phi_x1 = self.phi_network(x1)
+            
+            # Minimal scaling to ensure numerical stability without changing relationships
+            # Avoid mean subtraction which affects the relative positions of points
+            phi_x1_std = torch.std(phi_x1, dim=0, keepdim=True)
+            phi_x1_std = torch.clamp(phi_x1_std, min=1e-8)  # Avoid division by zero
+            phi_x1 = phi_x1 / phi_x1_std  # Scale only, no centering
+            
+            if x2 is not None:
+                if x2.dtype != next(self.phi_network.parameters()).dtype:
+                    x2 = x2.to(dtype=next(self.phi_network.parameters()).dtype)
+                phi_x2 = self.phi_network(x2)
+                
+                # Apply same scaling to x2 using x1's stats for consistency
+                phi_x2 = phi_x2 / phi_x1_std
+            else:
+                phi_x2 = None
+        
+        # Use base kernel on transformed features
+        base_kernel_output = self.base_kernel(phi_x1, phi_x2, diag=diag, **params)
+        
+        # If we're computing diagonal elements only, no need to modify further
+        if diag:
+            return base_kernel_output
+        
+        # If the output is a MultivariateNormal distribution, return as is
+        if isinstance(base_kernel_output, torch.distributions.MultivariateNormal):
+            return base_kernel_output
+            
+        # For matrix outputs, process and add jitter
+        if x2 is None:
+            # Add jitter when computing self-covariance
+            if hasattr(base_kernel_output, 'evaluate'):
+                # This is a lazy tensor
+                K = base_kernel_output.evaluate()
+            else:
+                # This is already a tensor
+                K = base_kernel_output
+                
+            # Add jitter only to the diagonal for numerical stability
+            eye_matrix = torch.eye(K.shape[0], dtype=K.dtype, device=K.device)
+            return K + self.jitter * eye_matrix
+        
+        # If x1 ≠ x2, no jitter needed
+        return base_kernel_output
 
 
-# Create custom GP model with neural network mean
+
+
+# Create custom GP model with neural network kernel
 class NeuralNetworkGP(SingleTaskGP):
     """
-    Gaussian Process with neural network mean function.
+    Gaussian Process with neural network kernel.
     
-    This hybrid model uses a neural network for mean prediction
-    while maintaining GP-based uncertainty estimates.
+    This hybrid model uses neural networks for kernel feature mapping
+    while maintaining standard GP mean functions.
     """
     
     def __init__(
         self, 
         train_X: torch.Tensor, 
         train_Y: torch.Tensor, 
-        nn_model: nn.Module,
-        likelihood=None,
-        outcome_transform=None
+        phi_network: nn.Module,
+        base_kernel = None,
+        mean_module = None,
+        likelihood = None,
+        outcome_transform = None,
+        jitter = 1e-3
     ):
         """
-        Initialize the neural network GP model
+        Initialize the neural network kernel GP model
         
         Args:
             train_X: Training inputs
             train_Y: Training targets
-            nn_model: Neural network model for mean prediction
+            phi_network: Neural network model for kernel feature mapping
+            base_kernel: Base kernel to use with phi features (default: RBF)
+            mean_module: Optional custom mean module (default: ConstantMean)
             likelihood: GPyTorch likelihood
             outcome_transform: Outcome transform
+            jitter: Jitter to add to kernel for numerical stability
         """
         # Print input shapes for debugging
         print(f"NeuralNetworkGP init: train_X shape={train_X.shape}, train_Y shape={train_Y.shape}")
         
-        # Store original Y dimension for the mean module
-        target_dim = train_Y.dim()
-        
         # Create a default likelihood if none provided
         if likelihood is None:
-            likelihood = gpytorch.likelihoods.GaussianLikelihood()
+            likelihood = gpytorch.likelihoods.GaussianLikelihood(
+                noise_constraint=gpytorch.constraints.GreaterThan(1e-4),
+                noise_prior=gpytorch.priors.GammaPrior(1.1, 0.05)  # Prior encouraging small noise values
+            )
             
-        # Initialize with custom mean module that knows the target dimension
-        mean_module = NeuralNetworkMean(nn_model, target_dim=target_dim)
+        # Use default mean module if none provided
+        if mean_module is None:
+            mean_module = gpytorch.means.ConstantMean()
+            
+        # Create neural network enhanced kernel
+        covar_module = PhiKernel(phi_network, base_kernel=base_kernel, jitter=jitter)
         
         if train_Y.dim() == 1:
             train_Y = train_Y.unsqueeze(-1)
-        # Initialize the parent GP model with our custom mean
+            
+        # Initialize the parent GP model with default mean and neural network kernel
         super().__init__(
             train_X=train_X, 
             train_Y=train_Y, 
             likelihood=likelihood,
             mean_module=mean_module,
+            covar_module=covar_module,
             outcome_transform=outcome_transform
         )
         
+        # Set initial noise to a small value to encourage exact fitting
+        self.likelihood.noise = torch.tensor(0.01)
+        
         # Store neural network model
-        self.nn_model = nn_model
+        self.phi_network = phi_network
 
 
-class NNQNEHVI(QNEHVI):
+
+
+class NNKernelQNEHVI(QNEHVI):
     """
-    Neural Network enhanced q-Noisy Expected Hypervolume Improvement (qNEHVI)
+    Neural Network Kernel enhanced q-Noisy Expected Hypervolume Improvement (qNEHVI)
     
-    This implementation uses neural networks for mean prediction
-    while maintaining GP-based uncertainty estimates.
+    This implementation uses neural networks to map inputs into a feature space,
+    creating a custom kernel for GP modeling. The neural network learns to project
+    inputs into a space where the standard kernel (e.g., RBF) can better capture
+    complex relationships between inputs and outputs.
+    
+    The approach is similar to deep kernel learning, where we:
+    1. Train neural networks to learn meaningful feature mappings
+    2. Use these networks as input transformations for GP kernels
+    3. Optimize hyperparameters for both the neural network and GP
     
     References:
     [1] S. Daulton, M. Balandat, and E. Bakshy. Parallel Bayesian Optimization of 
         Multiple Noisy Objectives with Expected Hypervolume Improvement. Advances 
         in Neural Information Processing Systems 34, 2021.
+    [2] Wilson, A.G., Hu, Z., Salakhutdinov, R., & Xing, E.P. (2016). 
+        Deep Kernel Learning. Artificial Intelligence and Statistics.
     """
     
     def __init__(
@@ -268,7 +281,7 @@ class NNQNEHVI(QNEHVI):
         noise_std: Optional[List[float]] = None,
         mc_samples: int = 128,
         
-        nn_layers: List[int] = [64, 32],
+        nn_layers: List[int] = [20, 16],
         nn_learning_rate: float = 0.01,
         nn_epochs: int = 300,
         nn_batch_size: int = 16,
@@ -277,7 +290,7 @@ class NNQNEHVI(QNEHVI):
         **kwargs
     ):
         """
-        Initialize the Neural Network enhanced qNEHVI optimizer
+        Initialize the Neural Network kernel qNEHVI optimizer
         
         Args:
             parameter_space: Parameter space to optimize
@@ -287,7 +300,7 @@ class NNQNEHVI(QNEHVI):
             ref_point: Reference point for hypervolume calculation
             noise_std: Standard deviation of observation noise for each objective
             mc_samples: Number of MC samples for acquisition function approximation
-            nn_layers: Hidden layer sizes for the neural network mean function
+            nn_layers: Hidden layer sizes for the neural network feature mapping
             nn_learning_rate: Learning rate for neural network training
             nn_epochs: Number of epochs for neural network training
             nn_batch_size: Batch size for neural network training
@@ -310,8 +323,8 @@ class NNQNEHVI(QNEHVI):
             'val_losses': []
         }
         
-        # Initialize neural network models
-        self.nn_models = []
+        # Initialize neural network models for kernel feature mapping
+        self.phi_models = []
         
         super().__init__(
             parameter_space=parameter_space,
@@ -344,17 +357,8 @@ class NNQNEHVI(QNEHVI):
         dtype = X.dtype
         print(f"Using dtype: {dtype}")
         
-        # Compute output range from training data
-        y_min = y.min(dim=0)[0].detach()
-        y_max = y.max(dim=0)[0].detach()
-        
-        # Add some margin to avoid boundary effects (5% of range)
-        y_range = y_max - y_min
-        y_min_with_margin = y_min - 0.05 * y_range
-        y_max_with_margin = y_max + 0.05 * y_range
-        
-        print(f"Output range for objective {objective_idx+1}: [{y_min.item():.4f}, {y_max.item():.4f}]")
-        print(f"Using range with margin: [{y_min_with_margin.item():.4f}, {y_max_with_margin.item():.4f}]")
+        # Use smaller embedding dimension
+        embedding_dim = 8
         
         # Create neural network model with the same dtype as the input data
         model = MLP(
@@ -362,23 +366,23 @@ class NNQNEHVI(QNEHVI):
             hidden_dims=self.nn_layers, 
             hidden_map_dim=self.hidden_map_dim if hidden_maps is not None else None,
             dtype=dtype,
-            dropout_rate=0.3,  # Increased dropout for stronger regularization
-            output_range=([y_min_with_margin.item()], [y_max_with_margin.item()])  # Constrain output
+            dropout_rate=0.2,  # Reduced dropout
+            output_dim=embedding_dim  # Smaller embedding dimension
         )
         
-        # Use combined loss: MSE for main prediction plus L2 norm for hidden map
+        # Use MSE loss for main prediction
         mse_criterion = nn.MSELoss()
         
-        # Define optimizer with smaller learning rate
+        # Define optimizer with appropriate learning rate and less regularization
         optimizer = optim.Adam(
             model.parameters(), 
-            lr=self.nn_learning_rate * 0.5,  # Reduced learning rate
-            weight_decay=self.nn_regularization * 5.0  # Increased L2 regularization
+            lr=self.nn_learning_rate,  # Use full learning rate
+            weight_decay=self.nn_regularization * 0.5  # Less L2 regularization
         )
         
-        # Add learning rate scheduler
+        # Add learning rate scheduler with more patience
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode='min', factor=0.5, patience=20,
+            optimizer, mode='min', factor=0.7, patience=30,
             verbose=True, min_lr=1e-6
         )
         
@@ -398,9 +402,9 @@ class NNQNEHVI(QNEHVI):
             hidden_maps_train = hidden_maps[train_indices]
             hidden_maps_val = hidden_maps[val_indices]
         
-        # Apply additional noise to training data for better generalization
+        # Apply minimal noise to training data for better generalization
         if X_train.shape[0] > 0:
-            noise_scale = 1e-3
+            noise_scale = 1e-4  # Much less noise
             X_train_noisy = X_train + torch.randn_like(X_train) * noise_scale
         else:
             X_train_noisy = X_train
@@ -423,8 +427,8 @@ class NNQNEHVI(QNEHVI):
         best_val_loss = float('inf')
         best_model_state = None
         
-        # Early stopping parameters
-        patience = 1000
+        # Early stopping parameters - more patience to allow convergence
+        patience = 50
         patience_counter = 0
         
         # Define map loss weight - adjust this to control importance
@@ -438,27 +442,52 @@ class NNQNEHVI(QNEHVI):
             
             # Handle different batch structures based on hidden map presence
             if hidden_maps is not None:
+                # Create VarianceCalculator for map distance calculation
+                VC = VarianceCalculator()
+                
                 for batch_X, batch_y, batch_maps in train_loader:
                     optimizer.zero_grad()
                     
-                    # Forward pass - returns both predictions
-                    outputs, predicted_maps = model(batch_X)
-                    
-                    # Calculate losses
-                    main_loss = mse_criterion(outputs, batch_y)
-                    map_loss = torch.mean((predicted_maps - batch_maps) ** 2)
-                    
-                    # Combined loss
-                    loss = main_loss + map_loss_weight * map_loss
-                    
-                    loss.backward()
-                    optimizer.step()
-                    train_loss += loss.item() * batch_X.size(0)
-            else:
-                for batch_X, batch_y in train_loader:
-                    optimizer.zero_grad()
+                    # Forward pass - returns outputs (embeddings)
                     outputs = model(batch_X)
-                    loss = mse_criterion(outputs, batch_y)
+                    
+                    # Calculate pairwise distance matrix between maps in the batch
+                    # Convert PyTorch tensors to numpy arrays for VarianceCalculator
+                    batch_maps_np = batch_maps.detach().cpu().numpy()
+                    
+                    # Need to reshape the maps if needed (assuming batch_maps is [batch_size, map_h, map_w])
+                    # Each map should be a 2D grid for the 2D Wasserstein distance calculation
+                    maps_list = [batch_maps_np[i] for i in range(batch_maps_np.shape[0])]
+                    
+                    # Calculate pairwise distances between maps
+                    # This returns a distance matrix of shape [batch_size, batch_size]
+                    map_distance_matrix = VC.calculate_pairwise_2d_distribution_distance(
+                        maps_list, 
+                        method= 'sliced', # 'sliced', 'mmd_1d'
+                        num_projections=20,
+                        target_size=None
+                    )['distance_matrix']
+                    # Convert distance matrix to similarity matrix in PyTorch
+                    # Invert and normalize distances to similarities (closer = more similar)
+                    map_distance_tensor = torch.tensor(map_distance_matrix, dtype=dtype)
+                    
+                    # Handle potential NaN values in the distance matrix
+                    map_distance_tensor = torch.nan_to_num(map_distance_tensor, nan=0.0)
+                    
+                    # Calculate the embedding similarity matrix using cosine similarity
+                    # Cosine is more stable than dot product for similarity
+                    normalized_embeddings = F.normalize(outputs, p=2, dim=1)
+                    embedding_similarity = torch.mm(normalized_embeddings, normalized_embeddings.t())
+                    
+                    # Normalize map distances (smaller distance = higher similarity)
+                    # Add small constant to avoid division by zero
+                    eps = 1e-8
+                    map_max_dist = torch.max(map_distance_tensor) + eps
+                    map_similarity = 1.0 - (map_distance_tensor / map_max_dist)
+                    
+                    # Calculate similarity loss (MSE between the two similarity matrices)
+                    loss = F.mse_loss(embedding_similarity, map_similarity.to(embedding_similarity.device, dtype=embedding_similarity.dtype))
+                    
                     loss.backward()
                     optimizer.step()
                     train_loss += loss.item() * batch_X.size(0)
@@ -470,18 +499,44 @@ class NNQNEHVI(QNEHVI):
             model.eval()
             with torch.no_grad():
                 if hidden_maps is not None:
-                    # Model returns both outputs and maps
-                    val_outputs, val_predicted_maps = model(X_val)
+                    # Extract validation maps
+                    hidden_maps_val_np = hidden_maps_val.detach().cpu().numpy()
+                    maps_list_val = [hidden_maps_val_np[i] for i in range(hidden_maps_val_np.shape[0])]
                     
-                    # Calculate losses
-                    val_main_loss = mse_criterion(val_outputs, y_val)
-                    val_map_loss = torch.mean((val_predicted_maps - hidden_maps_val) ** 2)
+                    # Calculate map distance matrix for validation data
+                    val_map_distance_matrix = VC.calculate_pairwise_2d_distribution_distance(
+                        maps_list_val,
+                        method='sliced',
+                        num_projections=50,
+                        target_size=50
+                    )['distance_matrix']
                     
-                    # Combined loss
-                    val_loss = val_main_loss + map_loss_weight * val_map_loss
+                    # Convert to similarity
+                    val_map_distance_tensor = torch.tensor(val_map_distance_matrix, dtype=dtype)
+                    # Handle potential NaN values
+                    val_map_distance_tensor = torch.nan_to_num(val_map_distance_tensor, nan=0.0)
+                    
+                    # Normalize map distances (smaller distance = higher similarity)
+                    eps = 1e-8
+                    val_map_max_dist = torch.max(val_map_distance_tensor) + eps
+                    val_map_similarity = 1.0 - (val_map_distance_tensor / val_map_max_dist)
+                    
+                    # Forward pass to get outputs
+                    val_outputs = model(X_val)
+                    
+                    # Calculate embedding similarity
+                    val_normalized_embeddings = F.normalize(val_outputs, p=2, dim=1)
+                    val_embedding_similarity = torch.mm(val_normalized_embeddings, val_normalized_embeddings.t())
+                    
+                    # Calculate similarity loss - ensure dtype consistency
+                    val_loss = F.mse_loss(
+                        val_embedding_similarity, 
+                        val_map_similarity.to(val_embedding_similarity.device, dtype=val_embedding_similarity.dtype)
+                    )
                 else:
                     val_outputs = model(X_val)
-                    val_loss = mse_criterion(val_outputs, y_val).item()
+                    # Ensure consistent dtype
+                    val_loss = mse_criterion(val_outputs, y_val.to(val_outputs.dtype))
                 
                 val_losses.append(val_loss)
                 
@@ -502,10 +557,10 @@ class NNQNEHVI(QNEHVI):
                     break
             
             # Print progress periodically
-            if (epoch + 1) % 100 == 0 or epoch == 0:
+            if (epoch + 1) % 10 == 0 or epoch == 0:
                 if hidden_maps is not None:
                     print(f"Epoch {epoch+1}/{self.nn_epochs}, Train Loss: {train_loss:.6f}, "
-                          f"Val Loss: {val_loss:.6f} (Main: {val_main_loss:.6f}, Map: {val_map_loss:.6f})")
+                          f"Val Loss: {val_loss:.6f}")
                 else:
                     print(f"Epoch {epoch+1}/{self.nn_epochs}, Train Loss: {train_loss:.6f}, Val Loss: {val_loss:.6f}")
         
@@ -537,43 +592,85 @@ class NNQNEHVI(QNEHVI):
         X = normalize(self.train_x, bounds_t)
         Y = self.train_y
         
-        print(f"Fitting hybrid NN-GP model with {len(X)} observations...")
+        print(f"Fitting NN-kernel GP model with {len(X)} observations...")
         print(f"Input tensor shapes: X={X.shape}, Y={Y.shape}")
-        
         # Create and fit a model for each objective
         models = []
-        self.nn_models = []  # Reset neural network models
+        self.phi_models = []  # Reset neural network models
         
-        for i in tqdm(range(self.n_objectives), desc="Fitting hybrid models"):
+        for i in tqdm(range(self.n_objectives), desc="Fitting NN-kernel models"):
             y = Y[:, i]  # Get ith objective, keep as 1D
             print(f"Objective {i+1}: y shape = {y.shape}, y dtype = {y.dtype}")
             
-            # Train neural network for mean prediction
+            # Train neural network for kernel feature mapping
             input_dim = X.shape[1]
             if self.train_hidden_maps is not None:
-                nn_model = self._train_neural_network(X, y.unsqueeze(-1), input_dim, i, self.train_hidden_maps)  # Pass 2D for training
+                phi_model = self._train_neural_network(X, y.unsqueeze(-1), input_dim, i, self.train_hidden_maps)  # Pass 2D for training
             else:
-                nn_model = self._train_neural_network(X, y.unsqueeze(-1), input_dim, i)  # Pass 2D for training
-            self.nn_models.append(nn_model)
+                phi_model = self._train_neural_network(X, y.unsqueeze(-1), input_dim, i)  # Pass 2D for training
+            self.phi_models.append(phi_model)
             
-            # Create GP model with neural network mean
+            # Create a combined kernel for better stability: Matern kernel is more numerically stable than RBF
+            # Use a lower nu value for a more flexible kernel
+            base_kernel = gpytorch.kernels.MaternKernel(nu=1.5, ard_num_dims=phi_model.output_dim)
+            
+            # Create GP model with neural network kernel
             model = NeuralNetworkGP(
                 train_X=X,
                 train_Y=y,  # Pass 1D tensor as BoTorch expects
-                nn_model=nn_model,
-                # outcome_transform=Standardize(m=1)
+                phi_network=phi_model,
+                # Use Matern kernel as base with larger jitter 
+                base_kernel=base_kernel,
+                # Add noise likelihood with reasonable constraint
+                likelihood=gpytorch.likelihoods.GaussianLikelihood(
+                    noise_constraint=gpytorch.constraints.GreaterThan(1e-5)
+                ),
+                outcome_transform=Standardize(m=1)
             )
-            # breakpoint()
+            
+            # Set initial noise to a small value to encourage fitting data closely
+            model.likelihood.noise = torch.tensor(0.01)
+            
             # Fit GP parameters (keeping neural network fixed)
             mll = ExactMarginalLogLikelihood(model.likelihood, model)
             
-            # Only optimize GP hyperparameters (not neural network)
-            fit_gpytorch_mll(mll)
+            # Only optimize GP hyperparameters
+            try:
+                # Configure optimizer settings for better convergence
+                fit_gpytorch_mll(
+                    mll,
+                    options={
+                        "max_iter": 200,    # More iterations
+                        "lr": 0.1,          # Higher learning rate
+                        "disp": True        # Show progress
+                    }
+                )
+                
+                # Check if model has reasonable noise parameter
+                print(f"Fitted noise parameter: {model.likelihood.noise.item()}")
+                
+                # If noise is too high, try to fit again with a stronger noise constraint
+                if model.likelihood.noise.item() > 0.1:
+                    print("Noise parameter too large, refitting with stronger constraint")
+                    model.likelihood = gpytorch.likelihoods.GaussianLikelihood(
+                        noise_constraint=gpytorch.constraints.Interval(1e-5, 0.05)
+                    )
+                    mll = ExactMarginalLogLikelihood(model.likelihood, model)
+                    fit_gpytorch_mll(mll)
+                
+                # Verify kernel works properly
+                with torch.no_grad():
+                    K = model.covar_module(X).evaluate()
+                    print(f"Kernel matrix shape: {K.shape}")
+                    print(f"Kernel matrix stats: min={K.min().item():.4f}, max={K.max().item():.4f}, mean={K.mean().item():.4f}")
+                    
+                    # Check if kernel matrix has NaN values
+                    if torch.any(torch.isnan(K)):
+                        print("Warning: NaN values in kernel matrix")
             
-            # Test mean function to ensure dimensions match
-            with torch.no_grad():
-                test_mean = model.mean_module(X)
-                print(f"Mean function output shape: {test_mean.shape}, targets shape: {y.shape}")
+            except Exception as e:
+                print(f"Error fitting GP: {e}")
+                print("Continuing with potentially suboptimal model")
             
             models.append(model)
         
@@ -814,7 +911,6 @@ class NNQNEHVI(QNEHVI):
         # Update budget tracking
         self.evaluated_points += len(xs)
         print(f"Tell called with {len(xs)} points. Total evaluated: {self.evaluated_points}/{self.budget}")
-        
         # Convert parameter dictionaries to tensors
         x_tensors = []
         for x in xs:
@@ -856,7 +952,6 @@ class NNQNEHVI(QNEHVI):
                     hidden_maps_tensors.append(h_map)
                 else:
                     print(f"Unsupported hidden_map type: {type(h_map)}. Skipping.")
-            
             if hidden_maps_tensors:
                 # Stack all tensors
                 stacked_hidden_maps = torch.stack(hidden_maps_tensors)
@@ -886,7 +981,6 @@ class NNQNEHVI(QNEHVI):
         Plot and save true vs predicted values for each objective using random test points.
         Evaluates model generalization by testing on unseen points from the domain.
         Plots both training data (seen) and test data (unseen) with different colors.
-        Also compares neural network predictions vs GP predictions with NN as mean function.
         
         Args:
             output_dir: Directory to save plots
@@ -899,13 +993,9 @@ class NNQNEHVI(QNEHVI):
         
         os.makedirs(output_dir, exist_ok=True)
         
-        # Make sure we have a model and nn_models
+        # Make sure we have a model
         if not hasattr(self, 'model') or self.model is None:
             print("Warning: GP models not available for plotting predictions")
-            return
-            
-        if not hasattr(self, 'nn_models') or len(self.nn_models) == 0:
-            print("Warning: Neural network models not available for plotting predictions")
             return
         
         # Generate test points by sampling from the parameter space
@@ -1233,325 +1323,114 @@ class NNQNEHVI(QNEHVI):
                 print("Falling back to random values for true evaluations")
                 true_np = np.random.rand(n_test_points, self.n_objectives) * 10
         
-        # Normalize inputs for both NN and GP prediction
+        # Normalize inputs for GP prediction
         X_norm_test = normalize(X_test_tensor, self.bounds.transpose(0, 1))
         
         # Get GP predictions for the test points
         with torch.no_grad():
             gp_predictions_test = self.model.posterior(X_norm_test).mean
             
-        # Get NN-only predictions for test points
-        nn_predictions_test = []
-        for i, nn_model in enumerate(self.nn_models):
-            with torch.no_grad():
-                # Use the neural network directly for predictions
-                nn_pred = nn_model(X_norm_test)
-                if type(nn_pred) == tuple:
-                    nn_pred, hidden_map = nn_pred
-
-                if type(nn_pred) == tuple:
-                    nn_pred, hidden_map = nn_pred
-                # Make sure output is the right shape
-                if nn_pred.dim() > 1 and nn_pred.shape[1] == 1:
-                    nn_pred = nn_pred.squeeze(-1)
-                nn_predictions_test.append(nn_pred)
-        
-        # Stack neural network predictions along a new dimension
-        nn_pred_tensor = torch.stack(nn_predictions_test, dim=1)
-        
         # Convert predictions to numpy for easier handling
         gp_pred_test_np = gp_predictions_test.cpu().numpy()
-        nn_pred_test_np = nn_pred_tensor.cpu().numpy()
         
         # Get predictions for the training points
         with torch.no_grad():
             X_norm_train = normalize(self.train_x, self.bounds.transpose(0, 1))
             gp_predictions_train = self.model.posterior(X_norm_train).mean
             
-            # Get NN-only predictions for training points
-            nn_predictions_train = []
-            for i, nn_model in enumerate(self.nn_models):
-                # Use the neural network directly for predictions
-                nn_pred = nn_model(X_norm_train)
-                if type(nn_pred) == tuple:
-                    nn_pred, hidden_map = nn_pred
-                # Make sure output is the right shape
-                if nn_pred.dim() > 1 and nn_pred.shape[1] == 1:
-                    nn_pred = nn_pred.squeeze(-1)
-                nn_predictions_train.append(nn_pred)
-                
-            # Stack neural network predictions along a new dimension
-            nn_pred_train_tensor = torch.stack(nn_predictions_train, dim=1)
-        
-        # Convert predictions and true values to numpy
+        # Convert training predictions and true values to numpy
         gp_pred_train_np = gp_predictions_train.cpu().numpy()
-        nn_pred_train_np = nn_pred_train_tensor.cpu().numpy()
         true_train_np = self.train_y.cpu().numpy()
         
         # Plot for each objective
         for i in range(self.n_objectives):
-            # Create figure with larger size for combined plot
-            plt.figure(figsize=(16, 12))
+            # Create figure
+            plt.figure(figsize=(10, 8))
+            plt.title(f'GP Predictions - Objective {i+1}')
             
-            # Subplot for GP predictions
-            plt.subplot(2, 2, 1)
-            plt.title(f'GP Predictions - Training Data (Objective {i+1})')
-            plt.scatter(true_train_np[:, i], gp_pred_train_np[:, i], alpha=0.7, color='blue', 
-                       marker='o')
+            # Plot training data points
+            plt.scatter(true_train_np[:, i], gp_pred_train_np[:, i], alpha=0.7, color='blue',
+                       marker='o', label='Training Data')
             
-            # Find min and max for diagonal line
-            min_val = min(np.min(true_train_np[:, i]), np.min(gp_pred_train_np[:, i]))
-            max_val = max(np.max(true_train_np[:, i]), np.max(gp_pred_train_np[:, i]))
-            plt.plot([min_val, max_val], [min_val, max_val], 'k--')
+            # Plot test data points
+            plt.scatter(true_np[:, i], gp_pred_test_np[:, i], alpha=0.7, color='red',
+                       marker='x', label='Test Data')
+            
+            # Find global min and max for diagonal line
+            global_min = min(np.min(true_train_np[:, i]), np.min(true_np[:, i]),
+                          np.min(gp_pred_train_np[:, i]), np.min(gp_pred_test_np[:, i]))
+            global_max = max(np.max(true_train_np[:, i]), np.max(true_np[:, i]),
+                          np.max(gp_pred_train_np[:, i]), np.max(gp_pred_test_np[:, i]))
+            plt.plot([global_min, global_max], [global_min, global_max], 'k--', label='Perfect prediction')
+            
             plt.xlabel('True values')
             plt.ylabel('GP predicted values')
+            plt.legend()
             
             # Calculate error metrics
             gp_train_mse = np.mean((true_train_np[:, i] - gp_pred_train_np[:, i])**2)
             gp_train_mae = np.mean(np.abs(true_train_np[:, i] - gp_pred_train_np[:, i]))
-            plt.text(0.05, 0.95, f'MSE: {gp_train_mse:.4f}\nMAE: {gp_train_mae:.4f}', 
-                    transform=plt.gca().transAxes, fontsize=9,
-                    bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.7))
-            
-            # Subplot for NN predictions
-            plt.subplot(2, 2, 2)
-            plt.title(f'NN Predictions - Training Data (Objective {i+1})')
-            plt.scatter(true_train_np[:, i], nn_pred_train_np[:, i], alpha=0.7, color='green', 
-                       marker='o')
-            
-            # Find min and max for diagonal line
-            min_val = min(np.min(true_train_np[:, i]), np.min(nn_pred_train_np[:, i]))
-            max_val = max(np.max(true_train_np[:, i]), np.max(nn_pred_train_np[:, i]))
-            plt.plot([min_val, max_val], [min_val, max_val], 'k--')
-            plt.xlabel('True values')
-            plt.ylabel('NN predicted values')
-            
-            # Calculate error metrics
-            nn_train_mse = np.mean((true_train_np[:, i] - nn_pred_train_np[:, i])**2)
-            nn_train_mae = np.mean(np.abs(true_train_np[:, i] - nn_pred_train_np[:, i]))
-            plt.text(0.05, 0.95, f'MSE: {nn_train_mse:.4f}\nMAE: {nn_train_mae:.4f}', 
-                    transform=plt.gca().transAxes, fontsize=9,
-                    bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.7))
-            
-            # Subplot for GP test predictions
-            plt.subplot(2, 2, 3)
-            plt.title(f'GP Predictions - Test Data (Objective {i+1})')
-            plt.scatter(true_np[:, i], gp_pred_test_np[:, i], alpha=0.7, color='red', 
-                       marker='x')
-            
-            # Find min and max for diagonal line
-            min_val = min(np.min(true_np[:, i]), np.min(gp_pred_test_np[:, i]))
-            max_val = max(np.max(true_np[:, i]), np.max(gp_pred_test_np[:, i]))
-            plt.plot([min_val, max_val], [min_val, max_val], 'k--')
-            plt.xlabel('True values')
-            plt.ylabel('GP predicted values')
-            
-            # Calculate error metrics
             gp_test_mse = np.mean((true_np[:, i] - gp_pred_test_np[:, i])**2)
             gp_test_mae = np.mean(np.abs(true_np[:, i] - gp_pred_test_np[:, i]))
-            plt.text(0.05, 0.95, f'MSE: {gp_test_mse:.4f}\nMAE: {gp_test_mae:.4f}', 
-                    transform=plt.gca().transAxes, fontsize=9,
-                    bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.7))
             
-            # Subplot for NN test predictions
-            plt.subplot(2, 2, 4)
-            plt.title(f'NN Predictions - Test Data (Objective {i+1})')
-            plt.scatter(true_np[:, i], nn_pred_test_np[:, i], alpha=0.7, color='orange', 
-                       marker='x')
-            
-            # Find min and max for diagonal line
-            min_val = min(np.min(true_np[:, i]), np.min(nn_pred_test_np[:, i]))
-            max_val = max(np.max(true_np[:, i]), np.max(nn_pred_test_np[:, i]))
-            plt.plot([min_val, max_val], [min_val, max_val], 'k--')
-            plt.xlabel('True values')
-            plt.ylabel('NN predicted values')
-            
-            # Calculate error metrics
-            nn_test_mse = np.mean((true_np[:, i] - nn_pred_test_np[:, i])**2)
-            nn_test_mae = np.mean(np.abs(true_np[:, i] - nn_pred_test_np[:, i]))
-            plt.text(0.05, 0.95, f'MSE: {nn_test_mse:.4f}\nMAE: {nn_test_mae:.4f}', 
-                    transform=plt.gca().transAxes, fontsize=9,
-                    bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.7))
-            
-            # Add overall title
-            plt.suptitle(f'GP vs. NN Predictions - Objective {i+1}\n' +
-                        f'Training: GP MSE={gp_train_mse:.4f}, NN MSE={nn_train_mse:.4f}\n' +
-                        f'Test: GP MSE={gp_test_mse:.4f}, NN MSE={nn_test_mse:.4f}', 
-                        fontsize=14)
-            
-            plt.tight_layout()
-            plt.subplots_adjust(top=0.88)  # Make room for suptitle
-            
-            # Save the combined plot
-            # plt.savefig(os.path.join(output_dir, f'gp_vs_nn_obj_{i+1}_iter_{iter_num}.png'), dpi=150)
-            plt.close()
-            
-            # Also create a combined plot - both models on same axes for direct comparison
-            plt.figure(figsize=(15, 10))
-            
-            # Training data
-            plt.subplot(1, 2, 1)
-            plt.title(f'Training Data - Objective {i+1}')
-            plt.scatter(true_train_np[:, i], gp_pred_train_np[:, i], alpha=0.7, color='blue', 
-                       marker='o', label='GP predictions')
-            plt.scatter(true_train_np[:, i], nn_pred_train_np[:, i], alpha=0.7, color='green', 
-                       marker='^', label='NN predictions')
-            
-            # Find global min and max for diagonal line
-            global_min = min(np.min(true_train_np[:, i]), np.min(gp_pred_train_np[:, i]), np.min(nn_pred_train_np[:, i]))
-            global_max = max(np.max(true_train_np[:, i]), np.max(gp_pred_train_np[:, i]), np.max(nn_pred_train_np[:, i]))
-            plt.plot([global_min, global_max], [global_min, global_max], 'k--', label='Perfect prediction')
-            
-            plt.xlabel('True values')
-            plt.ylabel('Predicted values')
-            plt.legend()
-            
-            # Error metrics text
-            plt.text(0.05, 0.95, 
-                    f'GP - MSE: {gp_train_mse:.4f}, MAE: {gp_train_mae:.4f}\n' +
-                    f'NN - MSE: {nn_train_mse:.4f}, MAE: {nn_train_mae:.4f}', 
-                    transform=plt.gca().transAxes, fontsize=10,
-                    bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.7))
-            
-            # Test data
-            plt.subplot(1, 2, 2)
-            plt.title(f'Test Data - Objective {i+1}')
-            plt.scatter(true_np[:, i], gp_pred_test_np[:, i], alpha=0.7, color='red', 
-                       marker='x', label='GP predictions')
-            plt.scatter(true_np[:, i], nn_pred_test_np[:, i], alpha=0.7, color='orange', 
-                       marker='+', label='NN predictions')
-            
-            # Find global min and max for diagonal line
-            global_min = min(np.min(true_np[:, i]), np.min(gp_pred_test_np[:, i]), np.min(nn_pred_test_np[:, i]))
-            global_max = max(np.max(true_np[:, i]), np.max(gp_pred_test_np[:, i]), np.max(nn_pred_test_np[:, i]))
-            plt.plot([global_min, global_max], [global_min, global_max], 'k--', label='Perfect prediction')
-            
-            plt.xlabel('True values')
-            plt.ylabel('Predicted values')
-            plt.legend()
-            
-            # Error metrics text
-            plt.text(0.05, 0.95, 
-                    f'GP - MSE: {gp_test_mse:.4f}, MAE: {gp_test_mae:.4f}\n' +
-                    f'NN - MSE: {nn_test_mse:.4f}, MAE: {nn_test_mae:.4f}', 
-                    transform=plt.gca().transAxes, fontsize=10,
-                    bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.7))
-            
-            # Add overall title
-            plt.suptitle(f'GP vs. NN Predictions Comparison - Objective {i+1}', fontsize=14)
-            
-            plt.tight_layout()
-            plt.subplots_adjust(top=0.90)  # Make room for suptitle
-            
-            # Save the overlay comparison plot
-            # plt.savefig(os.path.join(output_dir, f'comparison_obj_{i+1}_iter_{iter_num}.png'), dpi=150)
-            plt.close()
-            
-            # Create a new plot with both training and testing data in the same graph
-            plt.figure(figsize=(15, 8))
-            
-            # GP predictions - both training and testing
-            plt.subplot(1, 2, 1)
-            plt.title(f'GP Predictions Comparison - Objective {i+1}')
-            plt.scatter(true_train_np[:, i], gp_pred_train_np[:, i], alpha=0.7, color='blue', 
-                       marker='o', label='GP - Training Data')
-            plt.scatter(true_np[:, i], gp_pred_test_np[:, i], alpha=0.7, color='red', 
-                       marker='x', label='GP - Test Data')
-            
-            # Find global min and max for diagonal line
-            global_min = min(np.min(true_train_np[:, i]), np.min(true_np[:, i]), 
-                            np.min(gp_pred_train_np[:, i]), np.min(gp_pred_test_np[:, i]))
-            global_max = max(np.max(true_train_np[:, i]), np.max(true_np[:, i]), 
-                            np.max(gp_pred_train_np[:, i]), np.max(gp_pred_test_np[:, i]))
-            plt.plot([global_min, global_max], [global_min, global_max], 'k--', label='Perfect prediction')
-            
-            plt.xlabel('True values')
-            plt.ylabel('GP predicted values')
-            plt.legend()
-            
-            # Error metrics text
-            plt.text(0.05, 0.95, 
-                    f'GP Training - MSE: {gp_train_mse:.4f}, MAE: {gp_train_mae:.4f}\n' +
-                    f'GP Test - MSE: {gp_test_mse:.4f}, MAE: {gp_test_mae:.4f}', 
-                    transform=plt.gca().transAxes, fontsize=10,
-                    bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.7))
-            
-            # NN predictions - both training and testing
-            plt.subplot(1, 2, 2)
-            plt.title(f'NN Predictions Comparison - Objective {i+1}')
-            plt.scatter(true_train_np[:, i], nn_pred_train_np[:, i], alpha=0.7, color='green', 
-                       marker='^', label='NN - Training Data')
-            plt.scatter(true_np[:, i], nn_pred_test_np[:, i], alpha=0.7, color='orange', 
-                       marker='+', label='NN - Test Data')
-            
-            # Find global min and max for diagonal line
-            global_min = min(np.min(true_train_np[:, i]), np.min(true_np[:, i]), 
-                            np.min(nn_pred_train_np[:, i]), np.min(nn_pred_test_np[:, i]))
-            global_max = max(np.max(true_train_np[:, i]), np.max(true_np[:, i]), 
-                            np.max(nn_pred_train_np[:, i]), np.max(nn_pred_test_np[:, i]))
-            plt.plot([global_min, global_max], [global_min, global_max], 'k--', label='Perfect prediction')
-            
-            plt.xlabel('True values')
-            plt.ylabel('NN predicted values')
-            plt.legend()
-            
-            # Error metrics text
-            plt.text(0.05, 0.95, 
-                    f'NN Training - MSE: {nn_train_mse:.4f}, MAE: {nn_train_mae:.4f}\n' +
-                    f'NN Test - MSE: {nn_test_mse:.4f}, MAE: {nn_test_mae:.4f}', 
-                    transform=plt.gca().transAxes, fontsize=10,
-                    bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.7))
-            
-            # Add overall title
-            plt.suptitle(f'GP vs. NN Predictions - Objective {i+1}', fontsize=14)
-            
-            plt.tight_layout()
-            plt.subplots_adjust(top=0.90)  # Make room for suptitle
-            
-            # Save the combined training/testing plot
-            # plt.savefig(os.path.join(output_dir, f'combined_train_test_obj_{i+1}_iter_{iter_num}.png'), dpi=150)
-            plt.close()
-            
-            # Create another plot with both GP and NN in same graph for direct comparison
-            plt.figure(figsize=(10, 8))
-            plt.title(f'GP vs. NN Predictions Comparison - Objective {i+1}')
-            
-            # Plot all data points
-            plt.scatter(true_train_np[:, i], gp_pred_train_np[:, i], alpha=0.7, color='blue', 
-                      marker='o', label='GP - Training Data')
-            plt.scatter(true_np[:, i], gp_pred_test_np[:, i], alpha=0.7, color='red', 
-                      marker='x', label='GP - Test Data')
-            plt.scatter(true_train_np[:, i], nn_pred_train_np[:, i], alpha=0.7, color='green', 
-                      marker='^', label='NN - Training Data')
-            plt.scatter(true_np[:, i], nn_pred_test_np[:, i], alpha=0.7, color='orange', 
-                      marker='+', label='NN - Test Data')
-            
-            # Find global min and max for diagonal line
-            global_min = min(np.min(true_train_np[:, i]), np.min(true_np[:, i]), 
-                           np.min(gp_pred_train_np[:, i]), np.min(gp_pred_test_np[:, i]),
-                           np.min(nn_pred_train_np[:, i]), np.min(nn_pred_test_np[:, i]))
-            global_max = max(np.max(true_train_np[:, i]), np.max(true_np[:, i]), 
-                           np.max(gp_pred_train_np[:, i]), np.max(gp_pred_test_np[:, i]),
-                           np.max(nn_pred_train_np[:, i]), np.max(nn_pred_test_np[:, i]))
-            plt.plot([global_min, global_max], [global_min, global_max], 'k--', label='Perfect prediction')
-            
-            plt.xlabel('True values')
-            plt.ylabel('Predicted values')
-            plt.legend()
-            
-            # Error metrics text
-            plt.text(0.05, 0.95, 
-                   f'GP - Training MSE: {gp_train_mse:.4f}, MAE: {gp_train_mae:.4f}\n' +
-                   f'GP - Test MSE: {gp_test_mse:.4f}, MAE: {gp_test_mae:.4f}\n' +
-                   f'NN - Training MSE: {nn_train_mse:.4f}, MAE: {nn_train_mae:.4f}\n' +
-                   f'NN - Test MSE: {nn_test_mse:.4f}, MAE: {nn_test_mae:.4f}', 
+            # Add error metrics text box
+            plt.text(0.05, 0.95,
+                   f'Train - MSE: {gp_train_mse:.4f}, MAE: {gp_train_mae:.4f}\n' +
+                   f'Test - MSE: {gp_test_mse:.4f}, MAE: {gp_test_mae:.4f}',
                    transform=plt.gca().transAxes, fontsize=10,
                    bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.7))
             
             plt.tight_layout()
             
-            # Save the all-in-one comparison plot
-            plt.savefig(os.path.join(output_dir, f'true_vs_pred_obj_{i+1}_iter_{iter_num}.png'), dpi=150)
+            # Save the plot
+            plt.savefig(os.path.join(output_dir, f'gp_predictions_obj_{i+1}_iter_{iter_num}.png'), dpi=150)
+            plt.close()
+            
+            # Also create a separate plot for training and test data
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+            
+            # Training data subplot
+            ax1.set_title(f'Training Data - Objective {i+1}')
+            ax1.scatter(true_train_np[:, i], gp_pred_train_np[:, i], alpha=0.7, color='blue', marker='o')
+            
+            # Find min and max for diagonal line
+            min_val = min(np.min(true_train_np[:, i]), np.min(gp_pred_train_np[:, i]))
+            max_val = max(np.max(true_train_np[:, i]), np.max(gp_pred_train_np[:, i]))
+            ax1.plot([min_val, max_val], [min_val, max_val], 'k--')
+            
+            ax1.set_xlabel('True values')
+            ax1.set_ylabel('GP predicted values')
+            
+            # Add error metrics
+            ax1.text(0.05, 0.95, f'MSE: {gp_train_mse:.4f}\nMAE: {gp_train_mae:.4f}',
+                   transform=ax1.transAxes, fontsize=9,
+                   bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.7))
+            
+            # Test data subplot
+            ax2.set_title(f'Test Data - Objective {i+1}')
+            ax2.scatter(true_np[:, i], gp_pred_test_np[:, i], alpha=0.7, color='red', marker='x')
+            
+            # Find min and max for diagonal line
+            min_val = min(np.min(true_np[:, i]), np.min(gp_pred_test_np[:, i]))
+            max_val = max(np.max(true_np[:, i]), np.max(gp_pred_test_np[:, i]))
+            ax2.plot([min_val, max_val], [min_val, max_val], 'k--')
+            
+            ax2.set_xlabel('True values')
+            ax2.set_ylabel('GP predicted values')
+            
+            # Add error metrics
+            ax2.text(0.05, 0.95, f'MSE: {gp_test_mse:.4f}\nMAE: {gp_test_mae:.4f}',
+                   transform=ax2.transAxes, fontsize=9,
+                   bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.7))
+            
+            # Add overall title
+            plt.suptitle(f'GP Prediction Analysis - Objective {i+1}')
+            
+            plt.tight_layout()
+            plt.subplots_adjust(top=0.90)  # Make room for suptitle
+            
+            # Save the split plot
+            plt.savefig(os.path.join(output_dir, f'gp_train_test_obj_{i+1}_iter_{iter_num}.png'), dpi=150)
             plt.close()
 
     def plot_and_save_model_error(self, output_dir: str):

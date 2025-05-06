@@ -25,7 +25,7 @@ def run_optimization(algorithm_name, problem_name, budget, batch_size, output_di
     problem = get_test_problem(problem_name)
     adapter = get_algorithm_adapter(algorithm_name)
 
-    if 'hidden_map_dim' in problem.__dict__ and algorithm_name == 'nn-qnehvi':
+    if 'hidden_map_dim' in problem.__dict__ and algorithm_name in ['nn-qnehvi', 'nnk-qnehvi']:
         adapter.setup(problem, budget, batch_size, hidden_map_dim=problem.hidden_map_dim)
     else:
         adapter.setup(problem, budget, batch_size)
@@ -52,7 +52,7 @@ def run_optimization(algorithm_name, problem_name, budget, batch_size, output_di
         
         # Only pass output_dir to ask() for specific Bayesian optimization algorithms that support it
         # List of Bayesian optimization algorithms that use surrogate models and support output_dir
-        supported_models = ['qnehvi', 'nn-qnehvi']
+        supported_models = ['qnehvi', 'nn-qnehvi', 'nnk-qnehvi']
         
         try:
             if output_dir and algorithm_name.lower() in supported_models:
@@ -79,7 +79,7 @@ def run_optimization(algorithm_name, problem_name, budget, batch_size, output_di
         for i, candidate in enumerate(tqdm(candidates[:current_batch], desc="Evaluating candidates", leave=False)):
             value = problem.evaluate(candidate)
             if type(value) == tuple:
-                if algorithm_name != 'nn-qnehvi':
+                if algorithm_name not in ['nn-qnehvi', 'nnk-qnehvi']:
                     value = value[0]
                 else:
                     hidden_map= value[1]
@@ -95,8 +95,7 @@ def run_optimization(algorithm_name, problem_name, budget, batch_size, output_di
         
         # Update algorithm
         tqdm.write(f"Updating model with {current_batch} evaluations...")
-
-        if algorithm_name == 'nn-qnehvi' and hidden_maps:
+        if algorithm_name in ['nn-qnehvi', 'nnk-qnehvi'] and hidden_maps:
             adapter.tell(candidates[:current_batch], values, hidden_maps)
         else:
             adapter.tell(candidates[:current_batch], values)
