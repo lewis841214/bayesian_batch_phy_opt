@@ -386,12 +386,12 @@ class ComplexCategoryEmbeddingProblem(TestProblem):
     
     def __init__(self, n_embed=12):
         # Number of parameters and options
-        self.num_params = 10
-        self.num_options = 3
+        self.num_params = 8
+        self.num_options = 2
         self.n_embed = n_embed
         self.hidden_map_dim = [8, 12]
         # Seed for reproducibility
-        np.random.seed(42) # original: 42
+        np.random.seed(47) # original: 42
         
         # For each parameter (i), create a matrix of shape [num_options x n_embed]
         # mp[i][j] gives the embedding vector for option j of parameter i
@@ -452,7 +452,6 @@ class ComplexCategoryEmbeddingProblem(TestProblem):
         
         for i in range(1, self.num_params + 1):
             space.add_categorical_parameter(f'x{i}', options)
-            
         return space
     
     def evaluate(self, params: Dict[str, Any]) -> List[float]:

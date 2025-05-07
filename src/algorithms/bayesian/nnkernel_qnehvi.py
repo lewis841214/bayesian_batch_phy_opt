@@ -95,7 +95,6 @@ class MLP(nn.Module):
         
         # Through output layer
         output = self.output_layer(features)
-        
         return output
 
 
@@ -108,7 +107,7 @@ class PhiKernel(gpytorch.kernels.Kernel):
     This allows for complex, non-linear feature mapping in kernel space.
     """
     
-    def __init__(self, phi_network, base_kernel=None, jitter=1e-4, **kwargs):
+    def __init__(self, phi_network, base_kernel=None, jitter=None, **kwargs):
         """Initialize with phi network for feature transformation"""
         super().__init__(**kwargs)
         self.phi_network = phi_network
@@ -123,13 +122,13 @@ class PhiKernel(gpytorch.kernels.Kernel):
     def forward(self, x1, x2=None, diag=False, **params):
         """Apply phi transformation then compute kernel"""
         # Project inputs through phi network
+        print(x1.shape, x2.shape)
         with torch.no_grad():
             if x1.dtype != next(self.phi_network.parameters()).dtype:
                 x1 = x1.to(dtype=next(self.phi_network.parameters()).dtype)
             
             # Get embeddings without normalization to preserve the learned structure
             phi_x1 = self.phi_network(x1)
-            
             # Minimal scaling to ensure numerical stability without changing relationships
             # Avoid mean subtraction which affects the relative positions of points
             phi_x1_std = torch.std(phi_x1, dim=0, keepdim=True)
@@ -140,9 +139,11 @@ class PhiKernel(gpytorch.kernels.Kernel):
                 if x2.dtype != next(self.phi_network.parameters()).dtype:
                     x2 = x2.to(dtype=next(self.phi_network.parameters()).dtype)
                 phi_x2 = self.phi_network(x2)
-                
-                # Apply same scaling to x2 using x1's stats for consistency
-                phi_x2 = phi_x2 / phi_x1_std
+                try:
+                    # Apply same scaling to x2 using x1's stats for consistency
+                    phi_x2 = phi_x2 / phi_x1_std
+                except Exception as e:
+                    print(f"Error scaling phi_x2: {e}")
             else:
                 phi_x2 = None
         
@@ -170,7 +171,7 @@ class PhiKernel(gpytorch.kernels.Kernel):
             # Add jitter only to the diagonal for numerical stability
             eye_matrix = torch.eye(K.shape[0], dtype=K.dtype, device=K.device)
             return K + self.jitter * eye_matrix
-        
+        breakpoint()
         # If x1 ≠ x2, no jitter needed
         return base_kernel_output
 
@@ -195,7 +196,7 @@ class NeuralNetworkGP(SingleTaskGP):
         mean_module = None,
         likelihood = None,
         outcome_transform = None,
-        jitter = 1e-3
+        jitter = None
     ):
         """
         Initialize the neural network kernel GP model
@@ -215,10 +216,7 @@ class NeuralNetworkGP(SingleTaskGP):
         
         # Create a default likelihood if none provided
         if likelihood is None:
-            likelihood = gpytorch.likelihoods.GaussianLikelihood(
-                noise_constraint=gpytorch.constraints.GreaterThan(1e-4),
-                noise_prior=gpytorch.priors.GammaPrior(1.1, 0.05)  # Prior encouraging small noise values
-            )
+            likelihood = gpytorch.likelihoods.GaussianLikelihood()
             
         # Use default mean module if none provided
         if mean_module is None:
@@ -239,9 +237,6 @@ class NeuralNetworkGP(SingleTaskGP):
             covar_module=covar_module,
             outcome_transform=outcome_transform
         )
-        
-        # Set initial noise to a small value to encourage exact fitting
-        self.likelihood.noise = torch.tensor(0.01)
         
         # Store neural network model
         self.phi_network = phi_network
@@ -609,44 +604,23 @@ class NNKernelQNEHVI(QNEHVI):
                 train_X=X,
                 train_Y=y,  # Pass 1D tensor as BoTorch expects
                 phi_network=phi_model,
-                # Use Matern kernel as base with larger jitter 
+                # Use Matern kernel as base
                 base_kernel=base_kernel,
-                # Add noise likelihood with reasonable constraint
-                likelihood=gpytorch.likelihoods.GaussianLikelihood(
-                    noise_constraint=gpytorch.constraints.GreaterThan(1e-5)
-                ),
+                # Use standard likelihood
+                likelihood=None,
                 outcome_transform=Standardize(m=1)
             )
-            
-            # Set initial noise to a small value to encourage fitting data closely
-            model.likelihood.noise = torch.tensor(0.01)
             
             # Fit GP parameters (keeping neural network fixed)
             mll = ExactMarginalLogLikelihood(model.likelihood, model)
             
             # Only optimize GP hyperparameters
             try:
-                # Configure optimizer settings for better convergence
-                fit_gpytorch_mll(
-                    mll,
-                    options={
-                        "max_iter": 200,    # More iterations
-                        "lr": 0.1,          # Higher learning rate
-                        "disp": True        # Show progress
-                    }
-                )
+                # Use standard fit options
+                fit_gpytorch_mll(mll)
                 
                 # Check if model has reasonable noise parameter
                 print(f"Fitted noise parameter: {model.likelihood.noise.item()}")
-                
-                # If noise is too high, try to fit again with a stronger noise constraint
-                if model.likelihood.noise.item() > 0.1:
-                    print("Noise parameter too large, refitting with stronger constraint")
-                    model.likelihood = gpytorch.likelihoods.GaussianLikelihood(
-                        noise_constraint=gpytorch.constraints.Interval(1e-5, 0.05)
-                    )
-                    mll = ExactMarginalLogLikelihood(model.likelihood, model)
-                    fit_gpytorch_mll(mll)
                 
                 # Verify kernel works properly
                 with torch.no_grad():
@@ -838,53 +812,53 @@ class NNKernelQNEHVI(QNEHVI):
         n_restarts = 1
         raw_samples = 50
         
-        try:
-            # Debug print for optimization settings
-            print(f"DEBUG - Optimization settings: batch_size={effective_batch_size}, num_restarts={n_restarts}, raw_samples={raw_samples}")
+        # try:
+        # Debug print for optimization settings
+        print(f"DEBUG - Optimization settings: batch_size={effective_batch_size}, num_restarts={n_restarts}, raw_samples={raw_samples}")
+        breakpoint()
+        # Try with sequential=True first for better numerical stability
+        candidates, acq_values = optimize_acqf(
+            acq_function=acq_func,
+            bounds=standard_bounds,
+            q=effective_batch_size,
+            num_restarts=n_restarts,
+            raw_samples=raw_samples,
+            options={"batch_limit": 5, "maxiter": 100, "ftol": 1e-5, "method": "L-BFGS-B"},
+            sequential=True,
+        )
+        
+        if acq_values.numel() > 1:  # If we get multiple values
+            print(f"Acquisition values shape: {acq_values.shape}, taking mean")
+            acq_value_scalar = acq_values.mean().item()
+        else:
+            acq_value_scalar = acq_values.item()
             
-            # Try with sequential=True first for better numerical stability
-            candidates, acq_values = optimize_acqf(
-                acq_function=acq_func,
-                bounds=standard_bounds,
-                q=effective_batch_size,
-                num_restarts=n_restarts,
-                raw_samples=raw_samples,
-                options={"batch_limit": 5, "maxiter": 100, "ftol": 1e-5, "method": "L-BFGS-B"},
-                sequential=True,
-            )
+        print(f"Acquisition value: {acq_value_scalar:.6f}")
+        
+        # Unnormalize candidates
+        candidates = unnormalize(candidates.detach(), bounds_t)
             
-            if acq_values.numel() > 1:  # If we get multiple values
-                print(f"Acquisition values shape: {acq_values.shape}, taking mean")
-                acq_value_scalar = acq_values.mean().item()
-            else:
-                acq_value_scalar = acq_values.item()
-                
-            print(f"Acquisition value: {acq_value_scalar:.6f}")
-            
-            # Unnormalize candidates
-            candidates = unnormalize(candidates.detach(), bounds_t)
-            
-        except Exception as e:
-            print(f"Error in acquisition optimization: {e}. Using random samples.")
-            # Generate random samples instead
-            candidates = []
-            for _ in range(effective_batch_size):
-                random_params = {}
-                for name, config in self.parameter_space.parameters.items():
-                    if config['type'] == 'continuous':
-                        random_params[name] = config['bounds'][0] + np.random.random() * (config['bounds'][1] - config['bounds'][0])
-                    elif config['type'] == 'integer':
-                        random_params[name] = np.random.randint(config['bounds'][0], config['bounds'][1] + 1)
-                    elif config['type'] == 'categorical':
-                        if 'categories' in config:
-                            random_params[name] = np.random.choice(config['categories'])
-                        else:
-                            random_params[name] = np.random.choice(config['values'])
-                candidates.append(random_params)
+        # except Exception as e:
+        #     print(f"Error in acquisition optimization: {e}. Using random samples.")
+        #     # Generate random samples instead
+        #     candidates = []
+        #     for _ in range(effective_batch_size):
+        #         random_params = {}
+        #         for name, config in self.parameter_space.parameters.items():
+        #             if config['type'] == 'continuous':
+        #                 random_params[name] = config['bounds'][0] + np.random.random() * (config['bounds'][1] - config['bounds'][0])
+        #             elif config['type'] == 'integer':
+        #                 random_params[name] = np.random.randint(config['bounds'][0], config['bounds'][1] + 1)
+        #             elif config['type'] == 'categorical':
+        #                 if 'categories' in config:
+        #                     random_params[name] = np.random.choice(config['categories'])
+        #                 else:
+        #                     random_params[name] = np.random.choice(config['values'])
+        #         candidates.append(random_params)
             
             # Convert to tensor format
-            candidate_dicts = candidates
-            return candidate_dicts
+            # candidate_dicts = candidates
+            # return candidate_dicts
         
         elapsed = time.time() - start_time
         self.timing_history['acquisition_optimization'].append(elapsed)
@@ -892,7 +866,7 @@ class NNKernelQNEHVI(QNEHVI):
         
         # Convert tensor to dictionaries
         candidate_dicts = self._tensors_to_dicts(candidates)
-        
+        breakpoint()
         # Return a batch of candidates (ensuring we don't exceed batch size)
         return candidate_dicts[:effective_batch_size] 
 
@@ -1293,7 +1267,6 @@ class NNKernelQNEHVI(QNEHVI):
                                     complete_test_dict[param] = param_config['categories'][0]
                                 else:
                                     complete_test_dict[param] = param_config['values'][0]
-                                    
                         # Evaluate with the complete parameter set
                         test_result = test_problem.evaluate(complete_test_dict)
                         if type(test_result) == tuple:
@@ -1327,7 +1300,7 @@ class NNKernelQNEHVI(QNEHVI):
         with torch.no_grad():
             X_norm_train = normalize(self.train_x, self.bounds.transpose(0, 1))
             gp_predictions_train = self.model.posterior(X_norm_train).mean
-            
+        
         # Convert training predictions and true values to numpy
         gp_pred_train_np = gp_predictions_train.cpu().numpy()
         true_train_np = self.train_y.cpu().numpy()

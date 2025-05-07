@@ -23,7 +23,7 @@ class QNEHVIHybridAdapter(BayesianOptAdapter):
         self.nn_config = nn_config or {
             'hidden_layers': [30], # 12
             'learning_rate': 0.01,
-            'epochs': 500, # 100
+            'epochs': 5, # 100, 500
             'batch_size': 200, # 100
             'regularization': 1e-5 # 1e-4
         }
