@@ -386,7 +386,7 @@ class ComplexCategoryEmbeddingProblem(TestProblem):
     
     def __init__(self, n_embed=12):
         # Number of parameters and options
-        self.num_params = 8
+        self.num_params = 6
         self.num_options = 2
         self.n_embed = n_embed
         self.hidden_map_dim = [8, 12]

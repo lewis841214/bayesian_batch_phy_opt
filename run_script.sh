@@ -22,7 +22,7 @@ python tests/test_algorithms/unified_benchmark.py --compare --algorithms  qnehvi
 
  python tests/test_algorithms/unified_benchmark.py --compare --algorithms  randomsearch nsga2 nsga3 moead qnehvi nnk-qnehvi --problem complex_categorical --budget 200 --batch-size 10 --output-dir output/nnK_8_2_1lay_30_seed_47
 
-python tests/test_algorithms/unified_benchmark.py --compare --algorithms  randomsearch nsga2 nsga3 moead qnehvi nnk-qnehvi --problem complex_categorical --budget 200 --batch-size 10 --output-dir output/check_test_space
+python tests/test_algorithms/unified_benchmark.py --compare --algorithms   nnk-qnehvi --problem complex_categorical --budget 200 --batch-size 10 --output-dir output/check_test_space
 
 # randomsearch nsga2 nsga3 moead  qnehvi nn-qnehvi
 
