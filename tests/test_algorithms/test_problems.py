@@ -291,7 +291,7 @@ class CategoryMatrixTestProblem(TestProblem):
         self.option_weights = {}
         
         # Seed for reproducibility
-        np.random.seed(42)
+        # np.random.seed(42)
         
         # For each parameter
         for param_idx in range(1, self.num_params + 1):
@@ -387,16 +387,25 @@ class ComplexCategoryEmbeddingProblem(TestProblem):
     def __init__(self, n_embed=12):
         # Number of parameters and options
         self.num_params = 6
-        self.num_options = 2
+        self.num_options = 3
         self.n_embed = n_embed
         self.hidden_map_dim = [8, 12]
         # Seed for reproducibility
-        np.random.seed(47) # original: 42
-        
+        seed = np.random.randint(0, 1000000)
+        np.random.seed(seed)
+        print(f"Seed: {seed}")
         # For each parameter (i), create a matrix of shape [num_options x n_embed]
         # mp[i][j] gives the embedding vector for option j of parameter i
         self.param_embeddings = {}
         
+        self.param_random_dict = {}
+        for param_idx in range(1, self.num_params + 1):
+            self.param_random_dict[param_idx] = np.random.randint(0, 100)
+        self.option_random_dict = {}
+        for option_idx in range(self.num_options):
+            self.option_random_dict[option_idx] = np.random.randint(0, 10)
+
+
         for param_idx in range(1, self.num_params + 1):
             param_name = f'x{param_idx}'
             # Create embeddings for each option of this parameter
@@ -426,22 +435,22 @@ class ComplexCategoryEmbeddingProblem(TestProblem):
                     # Option D: Random values
                     embedding = np.random.normal(0, 1.0, size=n_embed)
                 
-                option_embeddings[option_name] = embedding
+                option_embeddings[option_name] = self.param_random_dict[param_idx] * self.option_random_dict[option_idx] * embedding / 10000
                 
             self.param_embeddings[param_name] = option_embeddings
         
         # Create weight matrices for non-linear transformations
         # First transformation: [15 x n_embed] -> [12 x n_embed]
-        self.W1 = np.random.normal(0, 0.5, size=(12, self.num_params))
+        self.W1 = np.abs(np.random.normal(0, 0.5, size=(12, self.num_params)))
         # Second transformation: [12 x n_embed] -> [8 x n_embed]
-        self.W2 = np.random.normal(0, 0.5, size=(8, 12))
+        self.W2 = np.abs(np.random.normal(0, 0.5, size=(8, 12)))
         # Final transformation: [8 x n_embed] -> [2]
-        self.W_final = np.random.normal(0, 0.5, size=(2, 8, n_embed))
+        self.W_final = np.abs(np.random.normal(0, 0.5, size=(2, 8, n_embed)))
         
         # Create biases
-        self.b1 = np.random.normal(0, 0.1, size=(12, 1))
-        self.b2 = np.random.normal(0, 0.1, size=(8, 1))
-        self.b_final = np.random.normal(0, 0.1, size=2)
+        self.b1 = np.abs(np.random.normal(0, 0.1, size=(12, 1)))
+        self.b2 = np.abs(np.random.normal(0, 0.1, size=(8, 1)))
+        self.b_final = np.abs(np.random.normal(0, 0.1, size=2))
     
     def get_parameter_space(self) -> ParameterSpace:
         """Return the parameter space with 15 categorical parameters"""
@@ -480,9 +489,12 @@ class ComplexCategoryEmbeddingProblem(TestProblem):
         hidden1 = np.maximum(0.1 * hidden1, hidden1)
         
         # Second layer: [8 x 12] x [12 x n_embed] = [8 x n_embed]
-        hidden2 = np.dot(self.W2, hidden1)
-        # Apply Tanh activation
+        hidden2 = np.abs(np.dot(self.W2, hidden1)) 
         hidden2 = np.abs(np.tanh(hidden2))
+        # hidden2 = hidden2 
+        # breakpoint()
+        # Apply Tanh activation
+        
         half_embed = self.n_embed // 2
 
         

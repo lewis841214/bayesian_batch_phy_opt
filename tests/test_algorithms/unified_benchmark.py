@@ -7,7 +7,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from typing import Dict, List, Any, Tuple, Optional, Union, Type
 from tqdm import tqdm
-
+import datetime
 # Add the project root to the path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
@@ -722,6 +722,8 @@ def main():
     
     args = parser.parse_args()
     
+    args.output_dir = args.output_dir + str(datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
+
     # List available problems if requested
     if args.list_problems:
         print("Available test problems:")

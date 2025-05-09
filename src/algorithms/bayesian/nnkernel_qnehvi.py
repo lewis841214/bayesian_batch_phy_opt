@@ -14,7 +14,7 @@ from gpytorch.mlls import ExactMarginalLogLikelihood
 from gpytorch.mlls.sum_marginal_log_likelihood import SumMarginalLogLikelihood
 from botorch.fit import fit_gpytorch_mll
 from botorch.utils.transforms import normalize, unnormalize
-from botorch.acquisition.multi_objective.monte_carlo import qNoisyExpectedHypervolumeImprovement
+from botorch.acquisition.multi_objective.monte_carlo import qNoisyExpectedHypervolumeImprovement, qExpectedHypervolumeImprovement 
 from botorch.optim.optimize import optimize_acqf
 from botorch.sampling.normal import SobolQMCNormalSampler
 from botorch.utils.multi_objective.box_decompositions.dominated import DominatedPartitioning
@@ -36,7 +36,7 @@ class MLP(nn.Module):
     """Multi-layer perceptron for feature mapping in kernel space"""
     
     def __init__(self, input_dim: int, hidden_dims: List[int], hidden_map_dim: Optional[List[int]] = None, 
-                 output_dim: int = 1, dtype=torch.float64, dropout_rate: float = 0.2):
+                 output_dim: int = 1, dtype=torch.float64, dropout_rate: float = 0.1):
         """
         Initialize MLP network
         
@@ -74,7 +74,7 @@ class MLP(nn.Module):
             
             # Use less dropout
             if i < len(hidden_dims) - 1:  # No dropout before final output
-                layers.append(nn.Dropout(dropout_rate * 0.5))
+                layers.append(nn.Dropout(dropout_rate * 0.1))
             
             prev_dim = dim
         
@@ -111,7 +111,7 @@ class PhiKernel(gpytorch.kernels.Kernel):
         """Initialize with phi network for feature transformation"""
         super().__init__(**kwargs)
         self.phi_network = phi_network
-        self.jitter = jitter
+        self.jitter = jitter if jitter is not None else 1e-6
         
         # Use RBF as default base kernel if none provided
         if base_kernel is None:
@@ -119,148 +119,54 @@ class PhiKernel(gpytorch.kernels.Kernel):
         else:
             self.base_kernel = base_kernel
     
-    # def forward(self, x1, x2=None, diag=False, **params):
-    #     """Apply phi transformation then compute kernel"""
-    #     # Project inputs through phi network
-    #     print(x1.shape, x2.shape)
-    #     with torch.no_grad():
-    #         if x1.dtype != next(self.phi_network.parameters()).dtype:
-    #             x1 = x1.to(dtype=next(self.phi_network.parameters()).dtype)
-            
-    #         # Get embeddings without normalization to preserve the learned structure
-    #         phi_x1 = self.phi_network(x1)
-    #         # Minimal scaling to ensure numerical stability without changing relationships
-    #         # Avoid mean subtraction which affects the relative positions of points
-    #         phi_x1_std = torch.std(phi_x1, dim=0, keepdim=True)
-    #         phi_x1_std = torch.clamp(phi_x1_std, min=1e-8)  # Avoid division by zero
-    #         phi_x1 = phi_x1 / phi_x1_std  # Scale only, no centering
-            
-    #         if x2 is not None:
-    #             if x2.dtype != next(self.phi_network.parameters()).dtype:
-    #                 x2 = x2.to(dtype=next(self.phi_network.parameters()).dtype)
-    #             phi_x2 = self.phi_network(x2)
-    #             try:
-    #                 # Apply same scaling to x2 using x1's stats for consistency
-    #                 phi_x2 = phi_x2 / phi_x1_std
-    #             except Exception as e:
-    #                 print(f"Error scaling phi_x2: {e}")
-    #         else:
-    #             phi_x2 = None
-        
-    #     # Use base kernel on transformed features
-    #     base_kernel_output = self.base_kernel(phi_x1, phi_x2, diag=diag, **params)
-        
-    #     # If we're computing diagonal elements only, no need to modify further
-    #     if diag:
-    #         return base_kernel_output
-        
-    #     # If the output is a MultivariateNormal distribution, return as is
-    #     if isinstance(base_kernel_output, torch.distributions.MultivariateNormal):
-    #         return base_kernel_output
-            
-    #     # For matrix outputs, process and add jitter
-    #     if x2 is None:
-    #         # Add jitter when computing self-covariance
-    #         if hasattr(base_kernel_output, 'evaluate'):
-    #             # This is a lazy tensor
-    #             K = base_kernel_output.evaluate()
-    #         else:
-    #             # This is already a tensor
-    #             K = base_kernel_output
-                
-    #         # Add jitter only to the diagonal for numerical stability
-    #         eye_matrix = torch.eye(K.shape[0], dtype=K.dtype, device=K.device)
-    #         return K + self.jitter * eye_matrix
-    #     breakpoint()
-    #     # If x1 ≠ x2, no jitter needed
-    #     return base_kernel_output
-    # def forward(self, x1, x2=None, diag=False, **params):
-    #     """Apply phi transformation then compute kernel"""
-    #     with torch.no_grad():
-    #         # Handle 3D input by processing each batch separately
-    #         if x1.dim() == 3:
-    #             batch_size, num_points, feature_dim = x1.shape
-    #             # Process each batch independently
-    #             phi_x1_list = []
-    #             for i in range(batch_size):
-    #                 # Get embeddings for this batch
-    #                 batch_x1 = x1[i]  # Shape: [num_points, feature_dim]
-    #                 if batch_x1.dtype != next(self.phi_network.parameters()).dtype:
-    #                     batch_x1 = batch_x1.to(dtype=next(self.phi_network.parameters()).dtype)
-                    
-    #                 # Get embeddings for this batch
-    #                 batch_phi_x1 = self.phi_network(batch_x1)
-                    
-    #                 # Compute scaling for this batch
-    #                 batch_phi_x1_std = torch.std(batch_phi_x1, dim=0, keepdim=True)
-    #                 batch_phi_x1_std = torch.clamp(batch_phi_x1_std, min=1e-8)
-    #                 batch_phi_x1 = batch_phi_x1 / batch_phi_x1_std
-                    
-    #                 phi_x1_list.append(batch_phi_x1)
-                
-    #             # Stack the processed batches
-    #             phi_x1 = torch.stack(phi_x1_list)  # Shape: [batch_size, num_points, embedding_dim]
-                
-    #             # Handle x2 if provided
-    #             if x2 is not None:
-    #                 phi_x2_list = []
-    #                 for i in range(batch_size):
-    #                     batch_x2 = x2[i]  # Shape: [num_points_x2, feature_dim]
-    #                     if batch_x2.dtype != next(self.phi_network.parameters()).dtype:
-    #                         batch_x2 = batch_x2.to(dtype=next(self.phi_network.parameters()).dtype)
-                        
-    #                     # Get embeddings for this batch
-    #                     batch_phi_x2 = self.phi_network(batch_x2)
-    #                     # Use the same scaling as the corresponding x1 batch
-    #                     batch_phi_x2 = batch_phi_x2 / batch_phi_x1_std
-                        
-    #                     phi_x2_list.append(batch_phi_x2)
-                    
-    #                 phi_x2 = torch.stack(phi_x2_list)  # Shape: [batch_size, num_points_x2, embedding_dim]
-    #             else:
-    #                 phi_x2 = None
-    #         else:
-    #             # Handle 2D input as before
-    #             if x1.dtype != next(self.phi_network.parameters()).dtype:
-    #                 x1 = x1.to(dtype=next(self.phi_network.parameters()).dtype)
-                
-    #             phi_x1 = self.phi_network(x1)
-    #             phi_x1_std = torch.std(phi_x1, dim=0, keepdim=True)
-    #             phi_x1_std = torch.clamp(phi_x1_std, min=1e-8)
-    #             phi_x1 = phi_x1 / phi_x1_std
-                
-    #             if x2 is not None:
-    #                 if x2.dtype != next(self.phi_network.parameters()).dtype:
-    #                     x2 = x2.to(dtype=next(self.phi_network.parameters()).dtype)
-    #                 phi_x2 = self.phi_network(x2)
-    #                 phi_x2 = phi_x2 / phi_x1_std
-    #             else:
-    #                 phi_x2 = None
-        
-    #     # Let the base kernel handle the batch dimension
-    #     return self.base_kernel(phi_x1, phi_x2, diag=diag, **params)
-
     def forward(self, x1, x2=None, diag=False, **params):
         """Apply phi transformation then compute kernel"""
+        # Store device for consistent tensor placement
+        device = x1.device
+        dtype = x1.dtype
+        
+        # This helps debug gradient issues
+        requires_grad = x1.requires_grad
+        
+        # Phi transformation - we can't use torch.no_grad() here as it breaks the gradient flow
+        # However, we can selectively turn off gradient tracking for the phi network
+        phi_network_training = self.phi_network.training
+        self.phi_network.eval()  # Set to eval mode for inference stability
+        
         # Handle 3D input by processing each batch separately
         if x1.dim() == 3:
             batch_size, num_points, feature_dim = x1.shape
+            
             # Process each batch independently
             phi_x1_list = []
+            phi_x1_std_list = []
+            
             for i in range(batch_size):
                 # Get embeddings for this batch
                 batch_x1 = x1[i]  # Shape: [num_points, feature_dim]
                 if batch_x1.dtype != next(self.phi_network.parameters()).dtype:
                     batch_x1 = batch_x1.to(dtype=next(self.phi_network.parameters()).dtype)
                 
-                # Get embeddings for this batch
+                # Get embeddings for this batch - don't track gradients through the network
+                old_requires_grad = {}
+                for p_name, param in self.phi_network.named_parameters():
+                    old_requires_grad[p_name] = param.requires_grad
+                    param.requires_grad_(False)
+                
+                # Forward pass
                 batch_phi_x1 = self.phi_network(batch_x1)
                 
-                # Compute scaling for this batch
-                batch_phi_x1_std = torch.std(batch_phi_x1, dim=0, keepdim=True)
-                batch_phi_x1_std = torch.clamp(batch_phi_x1_std, min=1e-8)
-                batch_phi_x1 = batch_phi_x1 / batch_phi_x1_std
+                # Restore requires_grad settings
+                for p_name, param in self.phi_network.named_parameters():
+                    param.requires_grad_(old_requires_grad[p_name])
                 
+                # Compute scaling for this batch - using larger min values for stability
+                batch_phi_x1_std = torch.std(batch_phi_x1, dim=0, keepdim=True)
+                batch_phi_x1_std = torch.clamp(batch_phi_x1_std, min=1e-6)
+                phi_x1_std_list.append(batch_phi_x1_std)
+                
+                # Apply scaling
+                batch_phi_x1 = batch_phi_x1 / batch_phi_x1_std
                 phi_x1_list.append(batch_phi_x1)
             
             # Stack the processed batches
@@ -274,10 +180,21 @@ class PhiKernel(gpytorch.kernels.Kernel):
                     if batch_x2.dtype != next(self.phi_network.parameters()).dtype:
                         batch_x2 = batch_x2.to(dtype=next(self.phi_network.parameters()).dtype)
                     
-                    # Get embeddings for this batch
+                    # Get embeddings for this batch - don't track gradients through the network
+                    old_requires_grad = {}
+                    for p_name, param in self.phi_network.named_parameters():
+                        old_requires_grad[p_name] = param.requires_grad
+                        param.requires_grad_(False)
+                    
+                    # Forward pass
                     batch_phi_x2 = self.phi_network(batch_x2)
+                    
+                    # Restore requires_grad settings
+                    for p_name, param in self.phi_network.named_parameters():
+                        param.requires_grad_(old_requires_grad[p_name])
+                    
                     # Use the same scaling as the corresponding x1 batch
-                    batch_phi_x2 = batch_phi_x2 / batch_phi_x1_std
+                    batch_phi_x2 = batch_phi_x2 / phi_x1_std_list[i]
                     
                     phi_x2_list.append(batch_phi_x2)
                 
@@ -289,21 +206,65 @@ class PhiKernel(gpytorch.kernels.Kernel):
             if x1.dtype != next(self.phi_network.parameters()).dtype:
                 x1 = x1.to(dtype=next(self.phi_network.parameters()).dtype)
             
+            # Don't track gradients through phi network to stabilize optimization
+            old_requires_grad = {}
+            for p_name, param in self.phi_network.named_parameters():
+                old_requires_grad[p_name] = param.requires_grad
+                param.requires_grad_(False)
+            
+            # Forward pass
             phi_x1 = self.phi_network(x1)
+            
+            # Restore requires_grad settings
+            for p_name, param in self.phi_network.named_parameters():
+                param.requires_grad_(old_requires_grad[p_name])
+                
+            # Compute scaling with better stability
             phi_x1_std = torch.std(phi_x1, dim=0, keepdim=True)
-            phi_x1_std = torch.clamp(phi_x1_std, min=1e-8)
+            phi_x1_std = torch.clamp(phi_x1_std, min=1e-6)  # Higher min value for stability
             phi_x1 = phi_x1 / phi_x1_std
             
             if x2 is not None:
                 if x2.dtype != next(self.phi_network.parameters()).dtype:
                     x2 = x2.to(dtype=next(self.phi_network.parameters()).dtype)
+                
+                # Don't track gradients through phi network
+                old_requires_grad = {}
+                for p_name, param in self.phi_network.named_parameters():
+                    old_requires_grad[p_name] = param.requires_grad
+                    param.requires_grad_(False)
+                
+                # Forward pass
                 phi_x2 = self.phi_network(x2)
+                
+                # Restore requires_grad settings
+                for p_name, param in self.phi_network.named_parameters():
+                    param.requires_grad_(old_requires_grad[p_name])
+                
+                # Scale x2 with x1's scaling for consistency
                 phi_x2 = phi_x2 / phi_x1_std
             else:
                 phi_x2 = None
         
+        # Restore phi network training state
+        self.phi_network.train(phi_network_training)
+        
         # Let the base kernel handle the batch dimension
-        return self.base_kernel(phi_x1, phi_x2, diag=diag, **params)
+        K = self.base_kernel(phi_x1, phi_x2, diag=diag, **params)
+        
+        # Add a small jitter for numerical stability when computing self-covariance
+        if x2 is None and not diag:
+            if not isinstance(K, gpytorch.lazy.LazyTensor):
+                # If K is a dense tensor, add jitter directly
+                eye_matrix = torch.eye(K.size(-1), device=device, dtype=dtype)
+                if K.dim() == 3:  # batched
+                    eye_matrix = eye_matrix.unsqueeze(0).expand(K.size(0), -1, -1)
+                K = K + self.jitter * eye_matrix
+            else:
+                # If K is a lazy tensor, add jitter through the add_jitter method
+                K = K.add_jitter(self.jitter)
+        
+        return K
 
 # Create custom GP model with neural network kernel
 class NeuralNetworkGP(SingleTaskGP):
@@ -341,15 +302,20 @@ class NeuralNetworkGP(SingleTaskGP):
         # Print input shapes for debugging
         print(f"NeuralNetworkGP init: train_X shape={train_X.shape}, train_Y shape={train_Y.shape}")
         
-        # Create a default likelihood if none provided
+        # Create a default likelihood if none provided with increased noise for stability
         if likelihood is None:
-            likelihood = gpytorch.likelihoods.GaussianLikelihood()
+            likelihood = gpytorch.likelihoods.GaussianLikelihood(
+                noise_constraint=gpytorch.constraints.GreaterThan(1e-4)
+            )
+            # Set initial noise to a larger value for better conditioning
+            likelihood.noise = torch.tensor(1e-3, device=train_X.device)
             
         # Use default mean module if none provided
         if mean_module is None:
             mean_module = gpytorch.means.ConstantMean()
             
-        # Create neural network enhanced kernel
+        # Create neural network enhanced kernel with improved jitter
+        jitter = 1e-5 if jitter is None else jitter
         covar_module = PhiKernel(phi_network, base_kernel=base_kernel, jitter=jitter)
         
         if train_Y.dim() == 1:
@@ -409,6 +375,7 @@ class NNKernelQNEHVI(QNEHVI):
         nn_batch_size: int = 16,
         nn_regularization: float = 1e-4,
         hidden_map_dim: Optional[List[int]] = None,
+        use_cuda: bool = True,
         **kwargs
     ):
         """
@@ -427,6 +394,7 @@ class NNKernelQNEHVI(QNEHVI):
             nn_epochs: Number of epochs for neural network training
             nn_batch_size: Batch size for neural network training
             nn_regularization: L2 regularization for neural network
+            use_cuda: Whether to use CUDA acceleration if available
         """
         # Store neural network parameters for future enhancements
         self.nn_layers = nn_layers
@@ -436,6 +404,11 @@ class NNKernelQNEHVI(QNEHVI):
         self.nn_regularization = nn_regularization
         self.hidden_map_dim = hidden_map_dim
 
+        # Set device (GPU if available and requested, otherwise CPU)
+        self.use_cuda = use_cuda and torch.cuda.is_available()
+        self.device = torch.device("cuda" if self.use_cuda else "cpu")
+        print(f"Using device: {self.device}")
+        
         # Initialize hidden maps container
         self.train_hidden_maps = None
 
@@ -458,7 +431,20 @@ class NNKernelQNEHVI(QNEHVI):
             mc_samples=mc_samples,
             **kwargs
         )
-    
+        
+        # Move reference point to appropriate device
+        if hasattr(self, 'ref_point') and self.ref_point is not None:
+            self.ref_point = self.ref_point.to(self.device)
+        
+        # Initialize bounds on the appropriate device
+        if hasattr(self, 'bounds') and self.bounds is not None:
+            self.bounds = self.bounds.to(self.device)
+        
+        # Initialize training data tensors on the appropriate device
+        if hasattr(self, 'train_x') and self.train_x is not None:
+            self.train_x = self.train_x.to(self.device)
+            self.train_y = self.train_y.to(self.device)
+
     def _train_neural_network(self, X: torch.Tensor, y: torch.Tensor, input_dim: int, objective_idx: int, hidden_maps: Optional[torch.Tensor] = None) -> nn.Module:
         """
         Train neural network for mean prediction
@@ -482,7 +468,7 @@ class NNKernelQNEHVI(QNEHVI):
         # Use smaller embedding dimension
         embedding_dim = 8
         
-        # Create neural network model with the same dtype as the input data
+        # Create neural network model with the same dtype as the input data and move to device
         model = MLP(
             input_dim=input_dim,
             hidden_dims=self.nn_layers, 
@@ -490,7 +476,7 @@ class NNKernelQNEHVI(QNEHVI):
             dtype=dtype,
             dropout_rate=0.2,  # Reduced dropout
             output_dim=embedding_dim  # Smaller embedding dimension
-        )
+        ).to(self.device)
         
         # Use MSE loss for main prediction
         mse_criterion = nn.MSELoss()
@@ -530,6 +516,17 @@ class NNKernelQNEHVI(QNEHVI):
             X_train_noisy = X_train + torch.randn_like(X_train) * noise_scale
         else:
             X_train_noisy = X_train
+            
+        # Make sure all tensors are on the right device
+        X_train_noisy = X_train_noisy.to(self.device)
+        y_train = y_train.to(self.device)
+        X_val = X_val.to(self.device)
+        y_val = y_val.to(self.device)
+        
+        if hidden_maps_train is not None:
+            hidden_maps_train = hidden_maps_train.to(self.device)
+        if hidden_maps_val is not None:
+            hidden_maps_val = hidden_maps_val.to(self.device)
         
         # Training loop
         train_losses = []
@@ -701,8 +698,8 @@ class NNKernelQNEHVI(QNEHVI):
             
         # Normalize inputs
         bounds_t = self.bounds.transpose(0, 1)  # Make it (n_dims, 2)
-        X = normalize(self.train_x, bounds_t)
-        Y = self.train_y
+        X = normalize(self.train_x, bounds_t).to(self.device)
+        Y = self.train_y.to(self.device)
         
         print(f"Fitting NN-kernel GP model with {len(X)} observations...")
         print(f"Input tensor shapes: X={X.shape}, Y={Y.shape}")
@@ -738,6 +735,9 @@ class NNKernelQNEHVI(QNEHVI):
                 outcome_transform=Standardize(m=1)
             )
             
+            # Move model to the appropriate device
+            model = model.to(self.device)
+            
             # Fit GP parameters (keeping neural network fixed)
             mll = ExactMarginalLogLikelihood(model.likelihood, model)
             
@@ -767,6 +767,7 @@ class NNKernelQNEHVI(QNEHVI):
         
         # Create a ModelListGP from the individual models
         model_list = ModelListGP(*models)
+        model_list = model_list.to(self.device)
             
         elapsed = time.time() - start_time
         self.timing_history['model_update'].append(elapsed)
@@ -871,7 +872,7 @@ class NNKernelQNEHVI(QNEHVI):
         
         # Normalize inputs for acquisition function
         bounds_t = self.bounds.transpose(0, 1)
-        X_baseline = normalize(self.train_x, bounds_t)
+        X_baseline = normalize(self.train_x, bounds_t).to(self.device)
         
         # Create acquisition function
         try:
@@ -883,8 +884,9 @@ class NNKernelQNEHVI(QNEHVI):
             
             # Debug print data types
             print(f"DEBUG - ref_point dtype: {self.ref_point.dtype}, X_baseline dtype: {X_baseline.dtype}")
+            print(f"DEBUG - Devices: ref_point: {self.ref_point.device}, X_baseline: {X_baseline.device}, model: {next(model_list.parameters()).device}")
             
-            # Create the acquisition function with the sampler - use qLogNoisyExpectedHypervolumeImprovement instead
+            # Create the acquisition function with the sampler
             try:
                 # Try to use the improved LogNEHVI implementation if available
                 from botorch.acquisition.multi_objective.monte_carlo import qLogNoisyExpectedHypervolumeImprovement
@@ -893,20 +895,28 @@ class NNKernelQNEHVI(QNEHVI):
                     ref_point=self.ref_point.clone().detach(),
                     X_baseline=X_baseline,
                     prune_baseline=True,
-                    alpha=alpha,
+                    alpha=alpha, # 0.2, # alpha,
                     sampler=sampler
                 )
                 print("Using qLogNoisyExpectedHypervolumeImprovement")
             except ImportError:
                 # Fall back to original NEHVI if the Log version isn't available
-                acq_func = qNoisyExpectedHypervolumeImprovement(
+                acq_func = qNoisyExpectedHypervolumeImprovement( # qExpectedHypervolumeImprovement( # qNoisyExpectedHypervolumeImprovement(
                     model=model_list,
                     ref_point=self.ref_point.clone().detach(),
                     X_baseline=X_baseline,
                     prune_baseline=True,
-                    alpha=alpha,
+                    alpha=alpha , # 0.2, #　alpha,
                     sampler=sampler
                 )
+                # acq_func = qExpectedHypervolumeImprovement( # qExpectedHypervolumeImprovement( # qNoisyExpectedHypervolumeImprovement(
+                #     model=model_list,
+                #     ref_point=self.ref_point.clone().detach(),
+                #     X_baseline=X_baseline,
+                #     prune_baseline=True,
+                #     alpha=alpha,
+                #     sampler=sampler
+                # )
                 print("Using qNoisyExpectedHypervolumeImprovement")
                 
         except Exception as e:
@@ -932,14 +942,13 @@ class NNKernelQNEHVI(QNEHVI):
         print(f"Optimizing acquisition function to find {effective_batch_size} candidates...")
         
         # Use standard bounds [0, 1] for optimization
-        standard_bounds = torch.zeros(2, X_baseline.shape[1], dtype=torch.double)
+        standard_bounds = torch.zeros(2, X_baseline.shape[1], dtype=torch.double, device=self.device)
         standard_bounds[1] = 1.0
         
         # Reduce number of restarts and raw samples for faster optimization
         n_restarts = 1
         raw_samples = 50
         
-        # try:
         # Debug print for optimization settings
         print(f"DEBUG - Optimization settings: batch_size={effective_batch_size}, num_restarts={n_restarts}, raw_samples={raw_samples}")
         
@@ -948,32 +957,74 @@ class NNKernelQNEHVI(QNEHVI):
         else:
             use_opt = True
         
-        use_opt = False
-        if use_opt:
-        
-            # Try with sequential=True first for better numerical stability
-            candidates, acq_values = optimize_acqf(
-                acq_function=acq_func,
-                bounds=standard_bounds,
-                q=effective_batch_size,
-                num_restarts=n_restarts,
-                raw_samples=raw_samples,
-                options={"batch_limit": 5, "maxiter": 100, "ftol": 1e-5, "method": "L-BFGS-B"},
-                sequential=True,
-            )
-            
-            if acq_values.numel() > 1:  # If we get multiple values
-                print(f"Acquisition values shape: {acq_values.shape}, taking mean")
-                acq_value_scalar = acq_values.mean().item()
-            else:
-                acq_value_scalar = acq_values.item()
+        try:
+            # use_opt = True
+            if use_opt:
                 
-            print(f"Acquisition value: {acq_value_scalar:.6f}")
+                try:
+                    # Try with sequential=True first for better numerical stability
+                    candidates, acq_values = optimize_acqf(
+                        acq_function=acq_func,
+                        bounds=standard_bounds,
+                        q=effective_batch_size,
+                        num_restarts=n_restarts,
+                        raw_samples=raw_samples,
+                        options={"batch_limit": 5, "maxiter": 100, "ftol": 1e-4, "method": "L-BFGS-B"},  # Increased ftol for stability
+                        sequential=True,
+                    )
+                except Exception as e:
+                    print(f"First optimization attempt failed: {e}")
+                    print("Trying with different parameters...")
+                    candidates, acq_values = optimize_acqf(
+                        acq_function=acq_func,
+                        bounds=standard_bounds,
+                        q=effective_batch_size,
+                        num_restarts=n_restarts,
+                        raw_samples=raw_samples,
+                        options={"batch_limit": 5, "maxiter": 100, "ftol": 1e-4, "method": "SLSQP"},  # Increased ftol for stability
+                        sequential=True,
+                    )
+                if acq_values.numel() > 1:  # If we get multiple values
+                    print(f"Acquisition values shape: {acq_values.shape}, taking mean")
+                    acq_value_scalar = acq_values.mean().item()
+                else:
+                    acq_value_scalar = acq_values.item()
+                    
+                print(f"Acquisition value: {acq_value_scalar:.6f}")
+                
+                # Unnormalize candidates
+                candidates = unnormalize(candidates.detach(), bounds_t)
+            else:
+                # Generate random samples instead
+                candidates = []
+                for _ in range(effective_batch_size):
+                    random_params = {}
+                    for name, config in self.parameter_space.parameters.items():
+                        if config['type'] == 'continuous':
+                            random_params[name] = config['bounds'][0] + np.random.random() * (config['bounds'][1] - config['bounds'][0])
+                        elif config['type'] == 'integer':
+                            random_params[name] = np.random.randint(config['bounds'][0], config['bounds'][1] + 1)
+                        elif config['type'] == 'categorical':
+                            if 'categories' in config:
+                                random_params[name] = np.random.choice(config['categories'])
+                            else:
+                                random_params[name] = np.random.choice(config['values'])
+                    candidates.append(random_params)
+                return candidates
             
-            # Unnormalize candidates
-            candidates = unnormalize(candidates.detach(), bounds_t)
-        else:
-            # Generate random samples instead
+            elapsed = time.time() - start_time
+            self.timing_history['acquisition_optimization'].append(elapsed)
+            print(f"Acquisition optimization completed in {elapsed:.2f} seconds")
+            
+            # Convert tensor to dictionaries
+            candidate_dicts = self._tensors_to_dicts(candidates)
+            
+            # Return a batch of candidates (ensuring we don't exceed batch size)
+            return candidate_dicts[:effective_batch_size]
+
+        except Exception as e:
+            print(f"Error running acquisition function optimization: {e}")
+            # Fall back to random sampling
             candidates = []
             for _ in range(effective_batch_size):
                 random_params = {}
@@ -988,21 +1039,8 @@ class NNKernelQNEHVI(QNEHVI):
                         else:
                             random_params[name] = np.random.choice(config['values'])
                 candidates.append(random_params)
-            
-            # Convert to tensor format
-            candidate_dicts = candidates
-            return candidate_dicts
+            return candidates
         
-        elapsed = time.time() - start_time
-        self.timing_history['acquisition_optimization'].append(elapsed)
-        print(f"Acquisition optimization completed in {elapsed:.2f} seconds")
-        
-        # Convert tensor to dictionaries
-        candidate_dicts = self._tensors_to_dicts(candidates)
-        # breakpoint()
-        # Return a batch of candidates (ensuring we don't exceed batch size)
-        return candidate_dicts[:effective_batch_size] 
-
     def tell(self, xs: List[Dict[str, Any]], ys: List[List[float]], hidden_maps = None):
         """Update model with evaluated points"""
         # Update budget tracking
@@ -1029,8 +1067,8 @@ class NNKernelQNEHVI(QNEHVI):
             x_tensors.append(torch.tensor(x_values, dtype=torch.double))
         
         # Stack tensors
-        x_tensor = torch.stack(x_tensors)
-        y_tensor = torch.tensor(ys, dtype=torch.double)
+        x_tensor = torch.stack(x_tensors).to(self.device)
+        y_tensor = torch.tensor(ys, dtype=torch.double).to(self.device)
         
         # Add to training data
         self.train_x = torch.cat([self.train_x, x_tensor])
@@ -1043,10 +1081,10 @@ class NNKernelQNEHVI(QNEHVI):
             for h_map in hidden_maps:
                 # Check if it's a numpy array and convert to tensor
                 if isinstance(h_map, np.ndarray):
-                    h_map_tensor = torch.tensor(h_map, dtype=torch.float32)
+                    h_map_tensor = torch.tensor(h_map, dtype=torch.float32).to(self.device)
                     hidden_maps_tensors.append(h_map_tensor)
                 elif isinstance(h_map, torch.Tensor):
-                    hidden_maps_tensors.append(h_map)
+                    hidden_maps_tensors.append(h_map.to(self.device))
                 else:
                     print(f"Unsupported hidden_map type: {type(h_map)}. Skipping.")
             if hidden_maps_tensors:

@@ -24,6 +24,11 @@ python tests/test_algorithms/unified_benchmark.py --compare --algorithms  qnehvi
 
 python tests/test_algorithms/unified_benchmark.py --compare --algorithms   nnk-qnehvi --problem complex_categorical --budget 200 --batch-size 10 --output-dir output/check_test_space
 
+python tests/test_algorithms/unified_benchmark.py --compare --algorithms    randomsearch nsga2 nsga3 moead  qnehvi nnk-qnehvi --problem complex_categorical --budget 200 --batch-size 10 --output-dir output/test_hybrid_8_2
+
+python tests/test_algorithms/unified_benchmark.py --compare --algorithms    randomsearch nsga2 nsga3 moead  qnehvi nnk-qnehvi --problem complex_categorical --budget 200 --batch-size 10 --output-dir output/test_full_7_2_47
+
+
 # randomsearch nsga2 nsga3 moead  qnehvi nn-qnehvi
 
 mixed': MixedParameterTestProblem(),
